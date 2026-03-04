@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/mlm-memory-preview.png" alt="MLM Memory Engine Preview">
+  <img src="./assets/mlm-memory-banner.png" alt="MLM Memory Engine Preview">
 </p>
 
 <p align="center">

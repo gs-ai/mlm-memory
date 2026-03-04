@@ -20,7 +20,9 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    background: var(--void);
+    background:
+      linear-gradient(rgba(10,10,15,0.84), rgba(10,10,15,0.90)),
+      url("./assets/mlm-memory-banner.png") center top / cover no-repeat fixed;
     color: var(--acid);
     font-family: 'Share Tech Mono', monospace;
     min-height: 100vh;
@@ -34,15 +36,6 @@
     background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px);
     pointer-events: none;
     z-index: 9999;
-  }
-
-  canvas#fractal {
-    position: fixed;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    opacity: 0.12;
-    z-index: 0;
   }
 
   .container {
@@ -249,7 +242,6 @@
 </style>
 </head>
 <body>
-<canvas id="fractal"></canvas>
 
 <div class="container">
   <div class="hero">
@@ -270,7 +262,7 @@
     <div class="markdown-docs" id="readme-docs">
 <!-- README_INJECT_START -->
 <p align="center">
-  <img src="./assets/mlm-memory-preview.png" alt="MLM Memory Engine Preview">
+  <img src="./assets/mlm-memory-banner.png" alt="MLM Memory Engine Preview">
 </p>
 <p align="center">
   <img alt="Apple Silicon" src="https://img.shields.io/badge/APPLE_SILICON-00ff9f?style=for-the-badge&logo=apple&logoColor=0a0a0f&labelColor=0a0a0f">
@@ -629,51 +621,6 @@ echo "  Proof complete. OMEGA ~= 10.8x"
 </div>
 
 <script>
-const canvas = document.getElementById('fractal');
-const ctx = canvas.getContext('2d');
-
-function drawFractal() {
-  const W = Math.max(300, Math.floor(window.innerWidth * 0.36));
-  const H = Math.max(180, Math.floor(window.innerHeight * 0.36));
-  const MAX = 70;
-  canvas.width = W;
-  canvas.height = H;
-
-  const imageData = ctx.createImageData(W, H);
-  const d = imageData.data;
-
-  for (let px = 0; px < W; px++) {
-    for (let py = 0; py < H; py++) {
-      const x0 = (px / W) * 3.5 - 2.5;
-      const y0 = (py / H) * 2.0 - 1.0;
-      let x = 0, y = 0, i = 0;
-
-      while (x * x + y * y <= 4 && i < MAX) {
-        const xt = x * x - y * y + x0;
-        y = 2 * x * y + y0;
-        x = xt;
-        i++;
-      }
-
-      const idx = (py * W + px) * 4;
-      if (i === MAX) {
-        d[idx] = 0; d[idx + 1] = 0; d[idx + 2] = 0; d[idx + 3] = 255;
-      } else {
-        const t = i / MAX;
-        d[idx] = 0;
-        d[idx + 1] = Math.floor(t * 255);
-        d[idx + 2] = Math.floor(t * 100);
-        d[idx + 3] = 255;
-      }
-    }
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-}
-
-window.addEventListener('resize', drawFractal, { passive: true });
-drawFractal();
-
 async function copyScript(btn, id) {
   const el = document.getElementById(id);
   const text = el ? el.innerText : '';

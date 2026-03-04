@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="./assets/mlm-memory-preview.png" alt="MLM Memory Engine Preview">
+</p>
+
+<p align="center">
+  <img alt="Apple Silicon" src="https://img.shields.io/badge/APPLE_SILICON-00ff9f?style=for-the-badge&logo=apple&logoColor=0a0a0f&labelColor=0a0a0f">
+  <img alt="Ollama" src="https://img.shields.io/badge/OLLAMA-ff006e?style=for-the-badge&logo=ollama&logoColor=ffffff&labelColor=0a0a0f">
+  <img alt="OMEGA" src="https://img.shields.io/badge/OMEGA-10.8x-00ff9f?style=for-the-badge&labelColor=0a0a0f">
+</p>
+
 # ∞ MLM-MEMORY ∞
 
 `ACID // PLASMA // VOID`
@@ -16,8 +26,6 @@ OMEGA = KV_quant x FlashAttn x VMCompress
       = 4.0 x 1.8 x 1.5
       = 10.8x
 ```
-
-The branding is fractal. The implementation is practical.
 
 ## WHAT THE PROGRAM CHANGES
 

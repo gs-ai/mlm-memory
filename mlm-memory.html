@@ -158,6 +158,18 @@
     white-space: pre;
   }
 
+  .markdown-docs a {
+    color: var(--acid);
+  }
+
+  .markdown-docs img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    border: 1px solid rgba(0,255,159,0.2);
+    box-shadow: var(--glow);
+  }
+
   .markdown-docs code.inline {
     background: rgba(0,255,159,0.08);
     border: 1px solid rgba(0,255,159,0.2);
@@ -257,6 +269,14 @@
     <h2 class="phase-title">README PROTOCOL</h2>
     <div class="markdown-docs" id="readme-docs">
 <!-- README_INJECT_START -->
+<p align="center">
+  <img src="./assets/mlm-memory-preview.png" alt="MLM Memory Engine Preview">
+</p>
+<p align="center">
+  <img alt="Apple Silicon" src="https://img.shields.io/badge/APPLE_SILICON-00ff9f?style=for-the-badge&logo=apple&logoColor=0a0a0f&labelColor=0a0a0f">
+  <img alt="Ollama" src="https://img.shields.io/badge/OLLAMA-ff006e?style=for-the-badge&logo=ollama&logoColor=ffffff&labelColor=0a0a0f">
+  <img alt="OMEGA" src="https://img.shields.io/badge/OMEGA-10.8x-00ff9f?style=for-the-badge&labelColor=0a0a0f">
+</p>
 <h1>∞ MLM-MEMORY ∞</h1>
 <p><code class="inline">ACID // PLASMA // VOID</code></p>
 <p>A functional Apple Silicon memory-optimization protocol for Ollama. Primary assets:</p>
@@ -269,7 +289,6 @@
 <pre><code>OMEGA = KV_quant x FlashAttn x VMCompress
       = 4.0 x 1.8 x 1.5
       = 10.8x</code></pre>
-<p>The branding is fractal. The implementation is practical.</p>
 <h2>WHAT THE PROGRAM CHANGES</h2>
 <h3>PHASE I // DETECTION + PREP</h3>
 <ul>

@@ -20,8 +20,19 @@ function escapeHtml(text) {
 }
 
 function formatInline(text) {
-  const escaped = escapeHtml(text);
-  return escaped.replace(/`([^`]+)`/g, '<code class="inline">$1</code>');
+  let escaped = escapeHtml(text);
+
+  const codeTokens = [];
+  escaped = escaped.replace(/`([^`]+)`/g, (_, code) => {
+    codeTokens.push(`<code class="inline">${code}</code>`);
+    return `@@CODE${codeTokens.length - 1}@@`;
+  });
+
+  escaped = escaped.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img alt="$1" src="$2">');
+  escaped = escaped.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  escaped = escaped.replace(/@@CODE(\d+)@@/g, (_, idx) => codeTokens[Number(idx)] || '');
+  return escaped;
 }
 
 function markdownToHtml(markdown) {
@@ -76,6 +87,14 @@ function markdownToHtml(markdown) {
     if (!trimmed) {
       flushParagraph();
       closeList();
+      continue;
+    }
+
+    // Allow raw HTML blocks in README (useful for centered banners/badges).
+    if (trimmed.startsWith('<')) {
+      flushParagraph();
+      closeList();
+      out.push(line);
       continue;
     }
 

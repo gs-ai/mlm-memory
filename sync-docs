@@ -1,0 +1,147 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+
+const root = path.resolve(__dirname);
+const readmePath = path.join(root, 'README.md');
+const scriptPath = path.join(root, 'mlm-memory');
+const htmlPath = path.join(root, 'mlm-memory.html');
+
+function readFile(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatInline(text) {
+  const escaped = escapeHtml(text);
+  return escaped.replace(/`([^`]+)`/g, '<code class="inline">$1</code>');
+}
+
+function markdownToHtml(markdown) {
+  const lines = markdown.split('\n');
+  const out = [];
+
+  let paragraph = [];
+  let inList = false;
+  let inCode = false;
+  let codeLines = [];
+
+  function flushParagraph() {
+    if (!paragraph.length) return;
+    out.push(`<p>${formatInline(paragraph.join(' '))}</p>`);
+    paragraph = [];
+  }
+
+  function closeList() {
+    if (!inList) return;
+    out.push('</ul>');
+    inList = false;
+  }
+
+  function flushCode() {
+    if (!inCode) return;
+    out.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+    inCode = false;
+    codeLines = [];
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('```')) {
+      flushParagraph();
+      closeList();
+
+      if (!inCode) {
+        inCode = true;
+        codeLines = [];
+      } else {
+        flushCode();
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      flushParagraph();
+      closeList();
+      continue;
+    }
+
+    if (trimmed.startsWith('# ')) {
+      flushParagraph();
+      closeList();
+      out.push(`<h1>${formatInline(trimmed.slice(2))}</h1>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('## ')) {
+      flushParagraph();
+      closeList();
+      out.push(`<h2>${formatInline(trimmed.slice(3))}</h2>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('### ')) {
+      flushParagraph();
+      closeList();
+      out.push(`<h3>${formatInline(trimmed.slice(4))}</h3>`);
+      continue;
+    }
+
+    if (trimmed.startsWith('- ')) {
+      flushParagraph();
+      if (!inList) {
+        out.push('<ul>');
+        inList = true;
+      }
+      out.push(`<li>${formatInline(trimmed.slice(2))}</li>`);
+      continue;
+    }
+
+    paragraph.push(trimmed);
+  }
+
+  flushParagraph();
+  closeList();
+  flushCode();
+
+  return out.join('\n');
+}
+
+function replaceBetween(content, startMarker, endMarker, replacement) {
+  const start = content.indexOf(startMarker);
+  const end = content.indexOf(endMarker);
+
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error(`Missing or invalid marker pair: ${startMarker} ... ${endMarker}`);
+  }
+
+  const before = content.slice(0, start + startMarker.length);
+  const after = content.slice(end);
+  return `${before}\n${replacement}\n${after}`;
+}
+
+const readme = readFile(readmePath);
+const script = readFile(scriptPath);
+let html = readFile(htmlPath);
+
+const readmeHtml = markdownToHtml(readme);
+const scriptHtml = escapeHtml(script);
+
+html = replaceBetween(html, '<!-- README_INJECT_START -->', '<!-- README_INJECT_END -->', readmeHtml);
+html = replaceBetween(html, '<!-- SCRIPT_INJECT_START -->', '<!-- SCRIPT_INJECT_END -->', scriptHtml);
+
+fs.writeFileSync(htmlPath, html);
+console.log('Synced README.md and mlm-memory into mlm-memory.html');

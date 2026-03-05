@@ -76,16 +76,14 @@ Generated runtime parameters:
 
 Note: deprecated `mirostat*` parameters were removed from the generated template.
 
-### PHASE V // LAUNCHAGENT PERSISTENCE
-Creates and loads:
+### PHASE V // AUTOSTART DISABLED
+Ensures Ollama does not auto-relaunch by:
 
-- `~/Library/LaunchAgents/com.ollama.mlm-memory.plist`
+- unloading `~/Library/LaunchAgents/com.ollama.mlm-memory.plist` (if present)
+- disabling `gui/$(id -u)/com.ollama.mlm-memory`
+- removing `~/Library/LaunchAgents/com.ollama.mlm-memory.plist`
 
-LaunchAgent runs:
-
-- `ollama serve`
-
-with MLM env vars preloaded.
+Run Ollama manually when needed (`ollama serve` or `ollama run ...`).
 
 ### PHASE VI // PROOF OUTPUT
 Prints detected RAM, estimated effective headroom (`RAM * 10`), and next-step model build commands.
@@ -108,15 +106,12 @@ ollama run richardyoung/qwen3-14b-abliterated-mlm:latest
 ## ARTIFACTS CREATED
 
 - `~/.ollama/mlm-memory_modelfiles/optimized.Modelfile`
-- `~/Library/LaunchAgents/com.ollama.mlm-memory.plist`
-- `/tmp/ollama-mlm-memory.log`
-- `/tmp/ollama-mlm-memory.err`
 
 ## VALIDATION
 
 ```bash
 bash -n ./mlm-memory
-launchctl print gui/$(id -u)/com.ollama.mlm-memory | sed -n '1,40p'
+launchctl print-disabled gui/$(id -u) | grep com.ollama.mlm-memory || true
 ```
 
 ## ROLLBACK CORE

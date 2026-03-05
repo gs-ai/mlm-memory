@@ -165,45 +165,17 @@ MODELFILE
 echo "  [OK] Optimized Modelfile written to: $MODELFILE_DIR/optimized.Modelfile"
 mandelbrot_iterate "Modelfile: |z_3| -> 0.067"
 
-print_phase "PHASE V -- Laplace Daemon Transform (LaunchAgent Persistence)"
+print_phase "PHASE V -- Non-Persistent Runtime (Autostart Disabled)"
 
 PLIST_PATH="$HOME/Library/LaunchAgents/com.ollama.mlm-memory.plist"
-mkdir -p "$(dirname "$PLIST_PATH")"
-
-cat > "$PLIST_PATH" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.ollama.mlm-memory</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${OLLAMA_PATH}</string>
-    <string>serve</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>OLLAMA_FLASH_ATTENTION</key><string>1</string>
-    <key>OLLAMA_KV_CACHE_TYPE</key><string>q4_0</string>
-    <key>OLLAMA_MAX_LOADED_MODELS</key><string>1</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>0</string>
-    <key>OLLAMA_NUM_PARALLEL</key><string>1</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ollama-mlm-memory.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ollama-mlm-memory.err</string>
-</dict>
-</plist>
-PLIST
+AGENT_LABEL="gui/$(id -u)/com.ollama.mlm-memory"
 
 launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
-launchctl load -w "$PLIST_PATH"
+launchctl disable "$AGENT_LABEL" >/dev/null 2>&1 || true
+rm -f "$PLIST_PATH"
 
-echo "  [OK] LaunchAgent installed and loaded: $PLIST_PATH"
-mandelbrot_iterate "LaunchAgent: Laplace stable at s = memory_savings"
+echo "  [OK] LaunchAgent disabled and removed (manual startup only)"
+mandelbrot_iterate "LaunchAgent: disabled -> no auto relaunch"
 
 print_phase "PHASE VI -- Final OMEGA Calculation"
 

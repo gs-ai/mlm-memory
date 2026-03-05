@@ -328,16 +328,14 @@
 <li><code class="inline">PARAMETER num_thread &lt;auto-detected&gt;</code></li>
 </ul>
 <p>Note: deprecated <code class="inline">mirostat*</code> parameters were removed from the generated template.</p>
-<h3>PHASE V // LAUNCHAGENT PERSISTENCE</h3>
-<p>Creates and loads:</p>
+<h3>PHASE V // AUTOSTART DISABLED</h3>
+<p>Ensures Ollama does not auto-relaunch by:</p>
 <ul>
-<li><code class="inline">~/Library/LaunchAgents/com.ollama.mlm-memory.plist</code></li>
+<li>unloading <code class="inline">~/Library/LaunchAgents/com.ollama.mlm-memory.plist</code> (if present)</li>
+<li>disabling <code class="inline">gui/$(id -u)/com.ollama.mlm-memory</code></li>
+<li>removing <code class="inline">~/Library/LaunchAgents/com.ollama.mlm-memory.plist</code></li>
 </ul>
-<p>LaunchAgent runs:</p>
-<ul>
-<li><code class="inline">ollama serve</code></li>
-</ul>
-<p>with MLM env vars preloaded.</p>
+<p>Run Ollama manually when needed (<code class="inline">ollama serve</code> or <code class="inline">ollama run ...</code>).</p>
 <h3>PHASE VI // PROOF OUTPUT</h3>
 <p>Prints detected RAM, estimated effective headroom (<code class="inline">RAM * 10</code>), and next-step model build commands.</p>
 <h2>QUICK DETONATION</h2>
@@ -350,13 +348,10 @@ ollama run richardyoung/qwen3-14b-abliterated-mlm:latest</code></pre>
 <h2>ARTIFACTS CREATED</h2>
 <ul>
 <li><code class="inline">~/.ollama/mlm-memory_modelfiles/optimized.Modelfile</code></li>
-<li><code class="inline">~/Library/LaunchAgents/com.ollama.mlm-memory.plist</code></li>
-<li><code class="inline">/tmp/ollama-mlm-memory.log</code></li>
-<li><code class="inline">/tmp/ollama-mlm-memory.err</code></li>
 </ul>
 <h2>VALIDATION</h2>
 <pre><code>bash -n ./mlm-memory
-launchctl print gui/$(id -u)/com.ollama.mlm-memory | sed -n '1,40p'</code></pre>
+launchctl print-disabled gui/$(id -u) | grep com.ollama.mlm-memory || true</code></pre>
 <h2>ROLLBACK CORE</h2>
 <pre><code>launchctl unload ~/Library/LaunchAgents/com.ollama.mlm-memory.plist
 rm ~/Library/LaunchAgents/com.ollama.mlm-memory.plist
@@ -542,45 +537,17 @@ MODELFILE
 echo "  [OK] Optimized Modelfile written to: $MODELFILE_DIR/optimized.Modelfile"
 mandelbrot_iterate "Modelfile: |z_3| -&gt; 0.067"
 
-print_phase "PHASE V -- Laplace Daemon Transform (LaunchAgent Persistence)"
+print_phase "PHASE V -- Non-Persistent Runtime (Autostart Disabled)"
 
 PLIST_PATH="$HOME/Library/LaunchAgents/com.ollama.mlm-memory.plist"
-mkdir -p "$(dirname "$PLIST_PATH")"
-
-cat &gt; "$PLIST_PATH" &lt;&lt;PLIST
-&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
-&lt;plist version="1.0"&gt;
-&lt;dict&gt;
-  &lt;key&gt;Label&lt;/key&gt;
-  &lt;string&gt;com.ollama.mlm-memory&lt;/string&gt;
-  &lt;key&gt;ProgramArguments&lt;/key&gt;
-  &lt;array&gt;
-    &lt;string&gt;${OLLAMA_PATH}&lt;/string&gt;
-    &lt;string&gt;serve&lt;/string&gt;
-  &lt;/array&gt;
-  &lt;key&gt;EnvironmentVariables&lt;/key&gt;
-  &lt;dict&gt;
-    &lt;key&gt;OLLAMA_FLASH_ATTENTION&lt;/key&gt;&lt;string&gt;1&lt;/string&gt;
-    &lt;key&gt;OLLAMA_KV_CACHE_TYPE&lt;/key&gt;&lt;string&gt;q4_0&lt;/string&gt;
-    &lt;key&gt;OLLAMA_MAX_LOADED_MODELS&lt;/key&gt;&lt;string&gt;1&lt;/string&gt;
-    &lt;key&gt;OLLAMA_KEEP_ALIVE&lt;/key&gt;&lt;string&gt;0&lt;/string&gt;
-    &lt;key&gt;OLLAMA_NUM_PARALLEL&lt;/key&gt;&lt;string&gt;1&lt;/string&gt;
-  &lt;/dict&gt;
-  &lt;key&gt;RunAtLoad&lt;/key&gt;&lt;true/&gt;
-  &lt;key&gt;KeepAlive&lt;/key&gt;&lt;true/&gt;
-  &lt;key&gt;StandardOutPath&lt;/key&gt;&lt;string&gt;/tmp/ollama-mlm-memory.log&lt;/string&gt;
-  &lt;key&gt;StandardErrorPath&lt;/key&gt;&lt;string&gt;/tmp/ollama-mlm-memory.err&lt;/string&gt;
-&lt;/dict&gt;
-&lt;/plist&gt;
-PLIST
+AGENT_LABEL="gui/$(id -u)/com.ollama.mlm-memory"
 
 launchctl unload "$PLIST_PATH" &gt;/dev/null 2&gt;&amp;1 || true
-launchctl load -w "$PLIST_PATH"
+launchctl disable "$AGENT_LABEL" &gt;/dev/null 2&gt;&amp;1 || true
+rm -f "$PLIST_PATH"
 
-echo "  [OK] LaunchAgent installed and loaded: $PLIST_PATH"
-mandelbrot_iterate "LaunchAgent: Laplace stable at s = memory_savings"
+echo "  [OK] LaunchAgent disabled and removed (manual startup only)"
+mandelbrot_iterate "LaunchAgent: disabled -&gt; no auto relaunch"
 
 print_phase "PHASE VI -- Final OMEGA Calculation"
 

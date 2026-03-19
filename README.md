@@ -3,125 +3,161 @@
 </p>
 
 <p align="center">
-  <img alt="Apple Silicon" src="https://img.shields.io/badge/APPLE_SILICON-00ff9f?style=for-the-badge&logo=apple&logoColor=0a0a0f&labelColor=0a0a0f">
-  <img alt="Ollama" src="https://img.shields.io/badge/OLLAMA-ff006e?style=for-the-badge&logo=ollama&logoColor=ffffff&labelColor=0a0a0f">
-  <img alt="OMEGA" src="https://img.shields.io/badge/OMEGA-10.8x-00ff9f?style=for-the-badge&labelColor=0a0a0f">
+  <img alt="Cross Platform" src="https://img.shields.io/badge/CROSS_PLATFORM-Linux%20%7C%20macOS%20%7C%20Windows-00ff9f?style=for-the-badge&labelColor=0a0a0f">
+  <img alt="Ollama" src="https://img.shields.io/badge/OLLAMA-SCOPED_RUNTIME-ff006e?style=for-the-badge&logo=ollama&logoColor=ffffff&labelColor=0a0a0f">
+  <img alt="Headroom" src="https://img.shields.io/badge/TARGET-2x%E2%80%933x_HEADROOM-00ff9f?style=for-the-badge&labelColor=0a0a0f">
 </p>
 
 # ∞ MLM-MEMORY ∞
 
 `ACID // PLASMA // VOID`
 
-A functional Apple Silicon memory-optimization protocol for Ollama.
-Primary assets:
+Cross-platform scoped memory optimization for Ollama.
 
-- `mlm-memory` (runnable program)
-- `mlm-memory.html` (themed interface + embedded script view)
-- `sync-docs` (injects README.md + mlm-memory into mlm-memory.html)
+`mlm-memory` analyzes your machine (CPU, RAM, GPU where available), derives an aggressive memory profile, and launches models through a private scoped Ollama runtime so other Ollama usage on the system stays unchanged.
 
-## OMEGA MODEL
+## WHAT CHANGED (2026-03-19)
 
-```text
-OMEGA = KV_quant x FlashAttn x VMCompress
-      = 4.0 x 1.8 x 1.5
-      = 10.8x
+- Replaced the old Bash workflow with a Python CLI (`analyze`, `setup`, `run`, `status`, `help`).
+- Added cross-platform support for Linux, macOS, and Windows 10+ (no Docker).
+- Switched from global/system-level tuning to scoped/private runtime tuning only.
+- `run` now starts a private loopback Ollama server for isolation and prints a shutdown report on exit.
+- Added hardware analysis and adaptive profile selection instead of fixed Apple-only assumptions.
+- Added generated artifacts: `analysis.json`, `manifest.json`, model-specific Modelfiles, and run logs.
+
+## MIGRATION NOTES (FROM OLDER MLM-MEMORY)
+
+- Old `*-mlm` tags and new `mlm-memory-*:scoped` tags can coexist.
+- `ollama list` may show similar sizes for related tags; this does not always mean duplicate blob storage.
+- If you want to clean old scoped aliases only:
+
+```bash
+ollama list | awk 'NR>1 {print $1}' | rg '^mlm-memory-' | while read -r m; do ollama rm "$m"; done
 ```
 
-## WHAT THE PROGRAM CHANGES
+- If you want to remove legacy custom tags (optional):
 
-### PHASE I // DETECTION + PREP
-- Detects architecture, Apple Silicon chip label, and logical CPU count
-- Computes dynamic thread target: `num_thread = logicalcpu - 2` (minimum `1`)
-- Locates Ollama binary (`ollama`, `/opt/homebrew/bin/ollama`, `/usr/local/bin/ollama`)
+```bash
+ollama rm richardyoung/qwen3-14b-abliterated-mlm:latest
+```
 
-### PHASE II // OLLAMA ENV RECONFIGURATION
-Sets and persists:
+## TARGET
 
-- `OLLAMA_FLASH_ATTENTION=1`
-- `OLLAMA_KV_CACHE_TYPE=q4_0`
-- `OLLAMA_MAX_LOADED_MODELS=1`
-- `OLLAMA_KEEP_ALIVE=0`
-- `OLLAMA_NUM_PARALLEL=1`
+```text
+Goal: increase practical model fit headroom by ~2x to 3x
+Method: tighter context/batch/concurrency + KV cache quantization + scoped runtime isolation
+```
 
-Writes those values into:
+Important: this is heuristic tuning, not a hard guarantee. Final fit still depends on model quantization, prompt length, adapters, and Ollama build behavior.
 
-- `launchctl` environment
-- `~/.zshrc`
-- `~/.bash_profile` (if present)
+## WHAT IT DOES
 
-### PHASE III // MEMORY PRESSURE TUNING (sudo)
-Attempts:
+1. Host analysis (Linux, macOS, Windows 10+)
+2. Memory profile derivation from detected hardware
+3. Scoped Modelfile generation for your selected base model
+4. Private loopback `ollama serve` launch with scoped env only
+5. Scoped alias build + run
+6. Shutdown/status report with active models and Ollama processes
 
-- `sudo sysctl -w vm.compressor_mode=4`
-- `sudo sysctl -w kern.memorystatus_vm_pressure_sends_note=1`
-- `sudo pmset -a sleep 0`
+## WHAT IT DOES NOT DO
 
-If sudo is unavailable, the script continues with warnings.
+- No global `launchctl` edits
+- No shell profile edits (`.zshrc`, `.bashrc`, etc.)
+- No Docker
+- No universal override of all Ollama models
 
-### PHASE IV // MODELFILE GENERATION
-Writes:
+## REQUIREMENTS
 
-- `~/.ollama/mlm-memory_modelfiles/optimized.Modelfile`
+- Python 3.9+
+- Ollama installed and available as `ollama` (or set `OLLAMA_BIN`)
 
-Default base model is now built in:
+## QUICK START
 
-- `FROM richardyoung/qwen3-14b-abliterated:latest`
-
-Generated runtime parameters:
-
-- `PARAMETER num_ctx 2048`
-- `PARAMETER num_batch 256`
-- `PARAMETER num_gpu 99`
-- `PARAMETER num_thread <auto-detected>`
-
-Note: deprecated `mirostat*` parameters were removed from the generated template.
-
-### PHASE V // AUTOSTART DISABLED
-Ensures Ollama does not auto-relaunch by:
-
-- unloading `~/Library/LaunchAgents/com.ollama.mlm-memory.plist` (if present)
-- disabling `gui/$(id -u)/com.ollama.mlm-memory`
-- removing `~/Library/LaunchAgents/com.ollama.mlm-memory.plist`
-
-Run Ollama manually when needed (`ollama serve` or `ollama run ...`).
-
-### PHASE VI // PROOF OUTPUT
-Prints detected RAM, estimated effective headroom (`RAM * 10`), and next-step model build commands.
-
-## QUICK DETONATION
+### macOS / Linux
 
 ```bash
 cd /path/to/mlm
 chmod +x ./mlm-memory
-./mlm-memory
+./mlm-memory analyze
+./mlm-memory setup
+./mlm-memory run
 ```
 
-## DEFAULT MODEL BUILD (MLM VARIANT)
+### Windows 10+
+
+```powershell
+cd C:\path\to\mlm
+python .\mlm-memory analyze
+python .\mlm-memory setup
+python .\mlm-memory run
+```
+
+## COMMANDS
+
+```text
+mlm-memory analyze
+mlm-memory setup [--model MODEL]
+mlm-memory run [--model MODEL] [MODEL] [-- <ollama run args...>]
+mlm-memory status
+mlm-memory help
+```
+
+Examples:
 
 ```bash
-ollama create richardyoung/qwen3-14b-abliterated-mlm:latest -f ~/.ollama/mlm-memory_modelfiles/optimized.Modelfile
-ollama run richardyoung/qwen3-14b-abliterated-mlm:latest
+./mlm-memory setup --model qwen2.5:14b
+./mlm-memory run --model qwen2.5:14b
+./mlm-memory run llama3.1:8b -- --verbose
+./mlm-memory status
 ```
 
-## ARTIFACTS CREATED
+## SCOPED TUNING USED
 
-- `~/.ollama/mlm-memory_modelfiles/optimized.Modelfile`
+The run path applies process-local Ollama settings such as:
+
+- `OLLAMA_KV_CACHE_TYPE=q4_0`
+- `OLLAMA_FLASH_ATTENTION=1`
+- `OLLAMA_MAX_LOADED_MODELS=1`
+- `OLLAMA_KEEP_ALIVE=0`
+- `OLLAMA_NUM_PARALLEL=1`
+- `OLLAMA_MAX_QUEUE=1`
+
+And per-model Modelfile parameters such as:
+
+- `num_ctx` (reduced)
+- `num_batch` (reduced)
+- `num_thread` (auto-sized)
+- `num_gpu` (set when appropriate, e.g. unified-memory Apple Silicon)
+
+## ARTIFACTS
+
+Created under `~/.ollama/mlm-memory_modelfiles`:
+
+- `analysis.json`
+- `manifest.json`
+- `<model-hash>.Modelfile`
+- `last-run-server.log`
+
+## SHUTDOWN CONFIRMATION
+
+After `run` exits (including Ctrl+C), the tool reports:
+
+- private scoped server shutdown status
+- scoped server model state before shutdown
+- currently running Ollama processes with PID and cwd when available
+- default server model state if reachable
 
 ## VALIDATION
 
 ```bash
-bash -n ./mlm-memory
-launchctl print-disabled gui/$(id -u) | grep com.ollama.mlm-memory || true
+python3 -m py_compile mlm-memory
+./mlm-memory --help
+./mlm-memory analyze
+./mlm-memory status
 ```
 
-## ROLLBACK CORE
+## ROLLBACK
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.ollama.mlm-memory.plist
-rm ~/Library/LaunchAgents/com.ollama.mlm-memory.plist
-
-grep -v "#MLM" ~/.zshrc > /tmp/zrc_tmp && mv /tmp/zrc_tmp ~/.zshrc
-[[ -f ~/.bash_profile ]] && grep -v "#MLM" ~/.bash_profile > /tmp/bp_tmp && mv /tmp/bp_tmp ~/.bash_profile
-
-sudo pmset -a sleep 1
+rm -rf ~/.ollama/mlm-memory_modelfiles
 ```

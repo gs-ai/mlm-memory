@@ -1,208 +1,1123 @@
-#!/usr/bin/env bash
-################################################################################
-##  MLM-MEMORY -- All Apple Silicon Edition                                   ##
-##  Configures Ollama memory-related settings and writes helper artifacts      ##
-################################################################################
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
-set -euo pipefail
+DEFAULT_MODEL = "richardyoung/qwen3-14b-abliterated:latest"
+ARTIFACT_DIR = Path.home() / ".ollama" / "mlm-memory_modelfiles"
+ANALYSIS_PATH = ARTIFACT_DIR / "analysis.json"
+MANIFEST_PATH = ARTIFACT_DIR / "manifest.json"
+SERVER_LOG_PATH = ARTIFACT_DIR / "last-run-server.log"
+REPORT_HEADER = "=" * 72
 
-print_phase() {
-  echo
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  ∫ $1"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-}
 
-mandelbrot_iterate() {
-  local label=${1:-}
-  echo "  [OK] Mandelbrot stable at: ${label}"
-}
+@dataclass
+class GPUInfo:
+    name: str
+    vendor: str = "unknown"
+    memory_bytes: Optional[int] = None
+    shared_memory: bool = False
+    notes: str = ""
 
-require_cmd() {
-  local cmd=${1:-}
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "[ERROR] Required command not found: $cmd" >&2
-    exit 1
-  fi
-}
 
-ollama_bin() {
-  if command -v ollama >/dev/null 2>&1; then
-    command -v ollama
+@dataclass
+class HostInfo:
+    os_name: str
+    os_version: str
+    architecture: str
+    cpu_name: str
+    logical_cpus: int
+    physical_cpus: Optional[int]
+    total_ram_bytes: Optional[int]
+    available_ram_bytes: Optional[int]
+    unified_memory: bool = False
+    gpus: List[GPUInfo] = field(default_factory=list)
+
+
+@dataclass
+class MemoryProfile:
+    name: str
+    headroom_target: str
+    estimated_budget_bytes: Optional[int]
+    fit_guidance: str
+    num_ctx: int
+    num_batch: int
+    num_thread: int
+    num_gpu: Optional[int]
+    flash_attention: bool
+    kv_cache_type: str
+    max_loaded_models: int
+    keep_alive: str
+    num_parallel: int
+    max_queue: int
+    caveats: List[str] = field(default_factory=list)
+
+
+class MlmMemoryError(Exception):
+    pass
+
+
+def eprint(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def print_block(title: str) -> None:
+    print(REPORT_HEADER)
+    print(title)
+    print(REPORT_HEADER)
+
+
+def safe_run(
+    command: Sequence[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
+    check: bool = False,
+    capture_output: bool = True,
+    text: bool = True,
+    cwd: Optional[Path] = None,
+) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            list(command),
+            env=env,
+            timeout=timeout,
+            check=check,
+            capture_output=capture_output,
+            text=text,
+            cwd=str(cwd) if cwd else None,
+        )
+    except FileNotFoundError as exc:
+        raise MlmMemoryError(f"Command not found: {command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise MlmMemoryError(f"Command timed out: {' '.join(command)}") from exc
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def bytes_to_gib(value: Optional[int]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 ** 3):.1f} GiB"
+
+
+def sanitize_name(value: str, max_length: int = 48) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    if not cleaned:
+        cleaned = "model"
+    return cleaned[:max_length].strip("-") or "model"
+
+
+def stable_alias(model: str) -> str:
+    digest = hashlib.sha256(model.encode("utf-8")).hexdigest()[:10]
+    name = sanitize_name(model)
+    return f"mlm-memory-{name}-{digest}:scoped"
+
+
+def artifact_prefix(model: str) -> str:
+    digest = hashlib.sha256(model.encode("utf-8")).hexdigest()[:10]
+    return f"{sanitize_name(model, 64)}-{digest}"
+
+
+def ensure_artifact_dir() -> None:
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
+def write_json(path: Path, payload: dict) -> None:
+    ensure_artifact_dir()
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def resolve_ollama_bin() -> Optional[str]:
+    candidates = []
+    env_bin = os.environ.get("OLLAMA_BIN")
+    if env_bin:
+        candidates.append(env_bin)
+    which_bin = shutil.which("ollama")
+    if which_bin:
+        candidates.append(which_bin)
+    if platform.system() == "Darwin":
+        candidates.extend(["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama"])
+    if platform.system() == "Windows":
+        localapp = os.environ.get("LOCALAPPDATA")
+        if localapp:
+            candidates.append(str(Path(localapp) / "Programs" / "Ollama" / "ollama.exe"))
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(Path(candidate))
+    return None
+
+
+def sysctl_value(key: str) -> Optional[str]:
+    if not command_exists("sysctl"):
+        return None
+    result = safe_run(["sysctl", "-n", key], timeout=4)
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def parse_int(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_macos_host() -> HostInfo:
+    os_version = platform.mac_ver()[0] or platform.release()
+    cpu_name = sysctl_value("machdep.cpu.brand_string") or platform.processor() or "Apple Silicon / Intel CPU"
+    logical = parse_int(sysctl_value("hw.logicalcpu")) or (os.cpu_count() or 1)
+    physical = parse_int(sysctl_value("hw.physicalcpu"))
+    total_ram = parse_int(sysctl_value("hw.memsize"))
+    available_ram = None
+    page_size = 4096
+    if command_exists("memory_pressure"):
+        memory_pressure = safe_run(["memory_pressure", "-Q"], timeout=4)
+        if memory_pressure.returncode == 0:
+            match = re.search(r"free percentage:\s+(\d+)%", memory_pressure.stdout or "", re.IGNORECASE)
+            if match and total_ram:
+                available_ram = int(total_ram * (int(match.group(1)) / 100.0))
+    vm_stat = safe_run(["vm_stat"], timeout=4)
+    if vm_stat.returncode == 0 and available_ram is None:
+        free_pages = 0
+        speculative_pages = 0
+        inactive_pages = 0
+        purgeable_pages = 0
+        page_match = re.search(r"page size of (\d+) bytes", vm_stat.stdout or "")
+        if page_match:
+            page_size = int(page_match.group(1))
+        for line in (vm_stat.stdout or "").splitlines():
+            match = re.match(r"([^:]+):\s+(\d+)[\.]", line.strip())
+            if not match:
+                continue
+            name = match.group(1)
+            pages = int(match.group(2))
+            if name == "Pages free":
+                free_pages = pages
+            if name == "Pages speculative":
+                speculative_pages = pages
+            if name == "Pages inactive":
+                inactive_pages = pages
+            if name == "Pages purgeable":
+                purgeable_pages = pages
+        available_ram = (free_pages + speculative_pages + inactive_pages + purgeable_pages) * page_size
+
+    gpus: List[GPUInfo] = []
+    unified_memory = platform.machine().lower() == "arm64"
+    if command_exists("system_profiler"):
+        sp = safe_run(["system_profiler", "SPDisplaysDataType", "-json"], timeout=20)
+        if sp.returncode == 0 and sp.stdout:
+            try:
+                payload = json.loads(sp.stdout)
+                for item in payload.get("SPDisplaysDataType", []):
+                    name = item.get("sppci_model") or item.get("_name") or "GPU"
+                    vram = item.get("spdisplays_vram") or item.get("spdisplays_vram_shared")
+                    memory_bytes = parse_vram_string(vram)
+                    gpus.append(
+                        GPUInfo(
+                            name=name,
+                            vendor=normalize_vendor(item.get("spdisplays_vendor") or ("apple" if unified_memory else "unknown")),
+                            memory_bytes=memory_bytes,
+                            shared_memory=bool(item.get("spdisplays_vram_shared")) or unified_memory,
+                        )
+                    )
+            except json.JSONDecodeError:
+                pass
+    if not gpus:
+        gpus.append(GPUInfo(name="Apple integrated GPU" if unified_memory else "macOS GPU", vendor="apple" if unified_memory else "unknown", shared_memory=unified_memory))
+
+    return HostInfo(
+        os_name="macOS",
+        os_version=os_version,
+        architecture=platform.machine() or platform.processor() or "unknown",
+        cpu_name=cpu_name,
+        logical_cpus=logical,
+        physical_cpus=physical,
+        total_ram_bytes=total_ram,
+        available_ram_bytes=available_ram,
+        unified_memory=unified_memory,
+        gpus=gpus,
+    )
+
+
+def parse_vram_string(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(GB|GiB|MB|MiB)", value, re.IGNORECASE)
+    if not match:
+        digits = re.sub(r"[^0-9]", "", value)
+        return int(digits) if digits else None
+    number = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit in {"gb", "gib"}:
+        return int(number * (1024 ** 3))
+    return int(number * (1024 ** 2))
+
+
+def collect_linux_host() -> HostInfo:
+    os_name = "Linux"
+    os_version = platform.release()
+    cpu_name = platform.processor() or "Linux CPU"
+    logical = os.cpu_count() or 1
+    physical = None
+    total_ram = None
+    available_ram = None
+    gpus: List[GPUInfo] = []
+
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        values: Dict[str, int] = {}
+        for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split(":", 1)
+            if len(parts) != 2:
+                continue
+            key, raw = parts
+            digits = re.findall(r"\d+", raw)
+            if digits:
+                values[key] = int(digits[0]) * 1024
+        total_ram = values.get("MemTotal")
+        available_ram = values.get("MemAvailable") or values.get("MemFree")
+
+    if command_exists("lscpu"):
+        lscpu = safe_run(["lscpu"], timeout=4)
+        if lscpu.returncode == 0:
+            for line in (lscpu.stdout or "").splitlines():
+                if line.startswith("Model name:"):
+                    cpu_name = line.split(":", 1)[1].strip() or cpu_name
+                elif line.startswith("Core(s) per socket:"):
+                    cores = parse_int(line.split(":", 1)[1])
+                    if cores:
+                        sockets = 1
+                        for other in (lscpu.stdout or "").splitlines():
+                            if other.startswith("Socket(s):"):
+                                sockets = parse_int(other.split(":", 1)[1]) or 1
+                                break
+                        physical = cores * sockets
+
+    if command_exists("nvidia-smi"):
+        nvidia = safe_run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=5,
+        )
+        if nvidia.returncode == 0:
+            for line in (nvidia.stdout or "").splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if not parts or not parts[0]:
+                    continue
+                memory = parse_int(parts[1]) if len(parts) > 1 else None
+                gpus.append(
+                    GPUInfo(
+                        name=parts[0],
+                        vendor="nvidia",
+                        memory_bytes=memory * (1024 ** 2) if memory else None,
+                    )
+                )
+    if not gpus and command_exists("lspci"):
+        lspci = safe_run(["lspci"], timeout=4)
+        if lspci.returncode == 0:
+            for line in (lspci.stdout or "").splitlines():
+                lowered = line.lower()
+                if "vga compatible controller" in lowered or "3d controller" in lowered or "display controller" in lowered:
+                    gpus.append(GPUInfo(name=line.split(": ", 1)[-1], vendor=guess_gpu_vendor(line)))
+    if not gpus:
+        amd_paths = list(Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"))
+        for path in amd_paths:
+            try:
+                memory_bytes = int(path.read_text().strip())
+            except (OSError, ValueError):
+                continue
+            gpus.append(GPUInfo(name=path.parent.parent.name, vendor="amd", memory_bytes=memory_bytes))
+
+    return HostInfo(
+        os_name=os_name,
+        os_version=os_version,
+        architecture=platform.machine() or "unknown",
+        cpu_name=cpu_name,
+        logical_cpus=logical,
+        physical_cpus=physical,
+        total_ram_bytes=total_ram,
+        available_ram_bytes=available_ram,
+        unified_memory=False,
+        gpus=gpus,
+    )
+
+
+def guess_gpu_vendor(name: str) -> str:
+    lowered = name.lower()
+    if "nvidia" in lowered:
+        return "nvidia"
+    if "amd" in lowered or "radeon" in lowered:
+        return "amd"
+    if "intel" in lowered:
+        return "intel"
+    return "unknown"
+
+
+def normalize_vendor(value: str) -> str:
+    lowered = value.lower()
+    if "apple" in lowered:
+        return "apple"
+    return guess_gpu_vendor(value)
+
+
+def powershell_json(script: str) -> Optional[object]:
+    if not command_exists("powershell"):
+        return None
+    result = safe_run(
+        ["powershell", "-NoProfile", "-Command", script],
+        timeout=12,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def collect_windows_host() -> HostInfo:
+    payload = powershell_json(
+        "$os = Get-CimInstance Win32_OperatingSystem; "
+        "$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1; "
+        "$gpu = Get-CimInstance Win32_VideoController | "
+        "Select-Object Name,AdapterRAM,DriverVersion; "
+        "[pscustomobject]@{"
+        "OSVersion=$os.Version; "
+        "CPUName=$cpu.Name; "
+        "Logical=$cpu.NumberOfLogicalProcessors; "
+        "Physical=$cpu.NumberOfCores; "
+        "TotalRAM=[int64]$os.TotalVisibleMemorySize * 1024; "
+        "FreeRAM=[int64]$os.FreePhysicalMemory * 1024; "
+        "GPUs=$gpu } | ConvertTo-Json -Depth 4"
+    )
+    cpu_name = platform.processor() or "Windows CPU"
+    logical = os.cpu_count() or 1
+    physical = None
+    total_ram = None
+    free_ram = None
+    gpus: List[GPUInfo] = []
+    os_version = platform.release()
+    if isinstance(payload, dict):
+        cpu_name = payload.get("CPUName") or cpu_name
+        logical = parse_int(payload.get("Logical")) or logical
+        physical = parse_int(payload.get("Physical"))
+        total_ram = parse_int(payload.get("TotalRAM"))
+        free_ram = parse_int(payload.get("FreeRAM"))
+        os_version = payload.get("OSVersion") or os_version
+        gpu_payload = payload.get("GPUs") or []
+        if isinstance(gpu_payload, dict):
+            gpu_payload = [gpu_payload]
+        for item in gpu_payload:
+            if not isinstance(item, dict):
+                continue
+            gpus.append(
+                GPUInfo(
+                    name=item.get("Name") or "GPU",
+                    vendor=guess_gpu_vendor(item.get("Name") or ""),
+                    memory_bytes=parse_int(item.get("AdapterRAM")),
+                )
+            )
+    return HostInfo(
+        os_name="Windows",
+        os_version=str(os_version),
+        architecture=platform.machine() or "unknown",
+        cpu_name=cpu_name,
+        logical_cpus=logical,
+        physical_cpus=physical,
+        total_ram_bytes=total_ram,
+        available_ram_bytes=free_ram,
+        unified_memory=False,
+        gpus=gpus,
+    )
+
+
+def collect_host_info() -> HostInfo:
+    system = platform.system()
+    if system == "Darwin":
+        return collect_macos_host()
+    if system == "Windows":
+        return collect_windows_host()
+    return collect_linux_host()
+
+
+def estimate_budget_bytes(host: HostInfo) -> Optional[int]:
+    total = host.total_ram_bytes
+    if not total:
+        return None
+    gpu_total = sum(gpu.memory_bytes or 0 for gpu in host.gpus)
+    if host.unified_memory:
+        budget = int(total * 0.58)
+        if host.available_ram_bytes:
+            budget = min(budget, int(host.available_ram_bytes * 0.92))
+    elif gpu_total:
+        budget = int(total * 0.35 + gpu_total * 0.92)
+        if host.available_ram_bytes:
+            budget = min(budget, int(host.available_ram_bytes * 0.80 + gpu_total * 0.92))
+    else:
+        budget = int(total * 0.42)
+        if host.available_ram_bytes:
+            budget = min(budget, int(host.available_ram_bytes * 0.88))
+    floor = int(total * 0.20)
+    return max(floor, budget)
+
+
+def choose_fit_guidance(budget_bytes: Optional[int], host: HostInfo) -> str:
+    if budget_bytes is None:
+        return "Unknown budget; start with quantized 7B-14B class models and validate manually."
+    budget_gib = budget_bytes / (1024 ** 3)
+    if host.unified_memory:
+        if budget_gib < 12:
+            return "Best fit: 3B-7B quantized, or 8B with very short context."
+        if budget_gib < 24:
+            return "Best fit: 7B-14B quantized with aggressive context limits."
+        if budget_gib < 48:
+            return "Best fit: 14B-32B quantized if offload is healthy and context stays low."
+        return "Best fit: 32B+ quantized may load, but context and throughput remain heavily constrained."
+    if any(gpu.memory_bytes for gpu in host.gpus):
+        if budget_gib < 12:
+            return "Best fit: 3B-7B quantized with short context."
+        if budget_gib < 24:
+            return "Best fit: 7B-14B quantized; 14B may require patience during load."
+        if budget_gib < 40:
+            return "Best fit: 14B-32B quantized with aggressive memory settings."
+        return "Best fit: 32B quantized may fit; larger models still depend on offload quality and KV pressure."
+    if budget_gib < 10:
+        return "Best fit: 3B-7B quantized on CPU only."
+    if budget_gib < 18:
+        return "Best fit: 7B-14B quantized on CPU only, with low context and low batch."
+    return "Best fit: 14B class quantized on CPU only; larger models remain unlikely."
+
+
+def build_profile(host: HostInfo) -> MemoryProfile:
+    logical = max(1, host.logical_cpus)
+    reserve = 2 if logical >= 4 else 1
+    threads = max(1, logical - reserve)
+    total_gib = (host.total_ram_bytes or 0) / (1024 ** 3)
+    has_gpu = bool(host.gpus)
+    has_discrete_vram = any(gpu.memory_bytes for gpu in host.gpus)
+
+    if total_gib and total_gib < 16:
+        name = "survival"
+        num_ctx = 1024
+        num_batch = 32
+        headroom = "up to 3x effective headroom versus permissive defaults"
+    elif total_gib and total_gib < 32:
+        name = "aggressive"
+        num_ctx = 1536
+        num_batch = 64
+        headroom = "about 2.5x effective headroom versus permissive defaults"
+    else:
+        name = "balanced-aggressive"
+        num_ctx = 2048
+        num_batch = 128
+        headroom = "about 2x effective headroom versus permissive defaults"
+
+    if not has_gpu and total_gib and total_gib < 24:
+        name = "cpu-tight"
+        num_ctx = min(num_ctx, 1024)
+        num_batch = min(num_batch, 24)
+        headroom = "up to 3x effective headroom on CPU-only hosts"
+
+    if host.unified_memory and total_gib and total_gib >= 64:
+        name = "unified-large"
+        num_ctx = 3072
+        num_batch = 192
+        headroom = "about 2x effective headroom while still leaving room for larger quantized models"
+
+    if has_discrete_vram and total_gib and total_gib >= 32:
+        num_batch = max(num_batch, 128)
+
+    caveats = [
+        "This profile deliberately cuts context, batch size, concurrency, and model residency to make larger models fit.",
+        "The 2-3x headroom target is heuristic only; model quantization, adapter layers, and prompt length still dominate memory use.",
+        "If a model still fails to load, move to a smaller quantization or a smaller base model rather than raising context first.",
+    ]
+    if platform.system() == "Windows":
+        caveats.append("Windows process cwd reporting is best-effort; shutdown reports may show cwd as unavailable.")
+    if not has_gpu:
+        caveats.append("No GPU VRAM was detected, so larger-model gains depend mostly on KV cache quantization and lower defaults.")
+
+    return MemoryProfile(
+        name=name,
+        headroom_target=headroom,
+        estimated_budget_bytes=estimate_budget_bytes(host),
+        fit_guidance=choose_fit_guidance(estimate_budget_bytes(host), host),
+        num_ctx=num_ctx,
+        num_batch=num_batch,
+        num_thread=threads,
+        num_gpu=999 if host.unified_memory else None,
+        flash_attention=True,
+        kv_cache_type="q4_0",
+        max_loaded_models=1,
+        keep_alive="0",
+        num_parallel=1,
+        max_queue=1,
+        caveats=caveats,
+    )
+
+
+def profile_to_json(host: HostInfo, profile: MemoryProfile) -> dict:
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host": {
+            **asdict(host),
+            "gpus": [asdict(gpu) for gpu in host.gpus],
+        },
+        "profile": asdict(profile),
+    }
+
+
+def print_analysis(host: HostInfo, profile: MemoryProfile) -> None:
+    print_block("MLM Memory Analysis")
+    print(f"Host OS:           {host.os_name} {host.os_version}")
+    print(f"Architecture:      {host.architecture}")
+    print(f"CPU:               {host.cpu_name}")
+    print(f"CPU cores:         {host.logical_cpus} logical", end="")
+    if host.physical_cpus:
+        print(f", {host.physical_cpus} physical")
+    else:
+        print()
+    print(f"RAM total:         {bytes_to_gib(host.total_ram_bytes)}")
+    print(f"RAM available:     {bytes_to_gib(host.available_ram_bytes)}")
+    print(f"Unified memory:    {'yes' if host.unified_memory else 'no'}")
+    if host.gpus:
+        print("GPU detection:")
+        for gpu in host.gpus:
+            memory = bytes_to_gib(gpu.memory_bytes)
+            suffix = " (shared)" if gpu.shared_memory else ""
+            notes = f" | {gpu.notes}" if gpu.notes else ""
+            print(f"  - {gpu.name} [{gpu.vendor}] {memory}{suffix}{notes}")
+    else:
+        print("GPU detection:     none found")
+
+    print()
+    print(f"Memory profile:    {profile.name}")
+    print(f"Headroom target:   {profile.headroom_target}")
+    print(f"Estimated budget:  {bytes_to_gib(profile.estimated_budget_bytes)}")
+    print(f"Fit guidance:      {profile.fit_guidance}")
+    print()
+    print("Scoped runtime tuning:")
+    print(f"  - num_ctx={profile.num_ctx}")
+    print(f"  - num_batch={profile.num_batch}")
+    print(f"  - num_thread={profile.num_thread}")
+    if profile.num_gpu is not None:
+        print(f"  - num_gpu={profile.num_gpu}")
+    print(f"  - OLLAMA_KV_CACHE_TYPE={profile.kv_cache_type}")
+    print(f"  - OLLAMA_FLASH_ATTENTION={'1' if profile.flash_attention else '0'}")
+    print(f"  - OLLAMA_MAX_LOADED_MODELS={profile.max_loaded_models}")
+    print(f"  - OLLAMA_KEEP_ALIVE={profile.keep_alive}")
+    print(f"  - OLLAMA_NUM_PARALLEL={profile.num_parallel}")
+    print(f"  - OLLAMA_MAX_QUEUE={profile.max_queue}")
+    print()
+    print("Caveats:")
+    for item in profile.caveats:
+        print(f"  - {item}")
+
+
+def write_modelfile(model: str, profile: MemoryProfile) -> Tuple[Path, str]:
+    ensure_artifact_dir()
+    alias = stable_alias(model)
+    prefix = artifact_prefix(model)
+    modelfile_path = ARTIFACT_DIR / f"{prefix}.Modelfile"
+    lines = [
+        "# Generated by mlm-memory. Scoped alias only; base model remains unchanged.",
+        f"FROM {model}",
+        f"PARAMETER num_ctx {profile.num_ctx}",
+        f"PARAMETER num_batch {profile.num_batch}",
+        f"PARAMETER num_thread {profile.num_thread}",
+    ]
+    if profile.num_gpu is not None:
+        lines.append(f"PARAMETER num_gpu {profile.num_gpu}")
+    modelfile_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return modelfile_path, alias
+
+
+def write_manifest(model: str, alias: str, modelfile_path: Path, host: HostInfo, profile: MemoryProfile) -> None:
+    write_json(
+        MANIFEST_PATH,
+        {
+            "default_model": DEFAULT_MODEL,
+            "model": model,
+            "scoped_alias": alias,
+            "artifact_dir": str(ARTIFACT_DIR),
+            "modelfile": str(modelfile_path),
+            "analysis": profile_to_json(host, profile),
+        },
+    )
+
+
+def build_scoped_env(base_env: Optional[Dict[str, str]], profile: MemoryProfile, host_port: str) -> Dict[str, str]:
+    env = dict(base_env or os.environ)
+    env["OLLAMA_HOST"] = host_port
+    env["OLLAMA_KV_CACHE_TYPE"] = profile.kv_cache_type
+    env["OLLAMA_FLASH_ATTENTION"] = "1" if profile.flash_attention else "0"
+    env["OLLAMA_MAX_LOADED_MODELS"] = str(profile.max_loaded_models)
+    env["OLLAMA_KEEP_ALIVE"] = profile.keep_alive
+    env["OLLAMA_NUM_PARALLEL"] = str(profile.num_parallel)
+    env["OLLAMA_MAX_QUEUE"] = str(profile.max_queue)
+    env["OLLAMA_CONTEXT_LENGTH"] = str(profile.num_ctx)
+    env.setdefault("OLLAMA_NO_CLOUD", "1")
+    return env
+
+
+def pick_loopback_host() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"127.0.0.1:{port}"
+
+
+def wait_for_server(ollama_bin: str, env: Dict[str, str], timeout_s: float = 20.0) -> None:
+    start = time.time()
+    last_error = "server did not answer"
+    while time.time() - start < timeout_s:
+        probe = safe_run([ollama_bin, "ps"], env=env, timeout=4)
+        if probe.returncode == 0:
+            return
+        stderr = (probe.stderr or "").strip()
+        if stderr:
+            last_error = stderr
+        time.sleep(0.5)
+    tail = ""
+    if SERVER_LOG_PATH.exists():
+        tail = "\n".join(SERVER_LOG_PATH.read_text(encoding="utf-8", errors="ignore").splitlines()[-20:])
+    detail = f"\nServer log tail:\n{tail}" if tail else ""
+    raise MlmMemoryError(f"Timed out waiting for private Ollama server on {env.get('OLLAMA_HOST')} ({last_error}).{detail}")
+
+
+def query_ollama_ps(ollama_bin: Optional[str], env: Optional[Dict[str, str]] = None) -> Tuple[str, Optional[str]]:
+    if not ollama_bin:
+        return "", "ollama binary not found"
+    result = safe_run([ollama_bin, "ps"], env=env, timeout=6)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "unable to query ollama ps").strip()
+        return "", message
+    return result.stdout.strip(), None
+
+
+def parse_ps_rows(output: str) -> List[str]:
+    return [line for line in output.splitlines() if line.strip()]
+
+
+def process_cwd(pid: int) -> str:
+    system = platform.system()
+    if system == "Windows":
+        return "unavailable"
+    proc_cwd = Path(f"/proc/{pid}/cwd")
+    if proc_cwd.exists():
+        try:
+            return os.readlink(proc_cwd)
+        except OSError:
+            pass
+    if command_exists("lsof"):
+        result = safe_run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=4)
+        if result.returncode == 0:
+            for line in (result.stdout or "").splitlines():
+                if line.startswith("n"):
+                    return line[1:] or "unavailable"
+    if command_exists("pwdx"):
+        result = safe_run(["pwdx", str(pid)], timeout=4)
+        if result.returncode == 0 and ":" in (result.stdout or ""):
+            return result.stdout.split(":", 1)[1].strip() or "unavailable"
+    return "unavailable"
+
+
+def collect_ollama_processes() -> List[dict]:
+    processes: List[dict] = []
+    system = platform.system()
+    if system == "Windows":
+        payload = powershell_json(
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -match 'ollama' -or $_.CommandLine -match 'ollama' } | "
+            "Select-Object ProcessId,Name,CommandLine,ExecutablePath | ConvertTo-Json -Depth 3"
+        )
+        if isinstance(payload, dict):
+            payload = [payload]
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                command = item.get("CommandLine") or item.get("Name") or "ollama"
+                if "ollama" not in command.lower():
+                    continue
+                processes.append(
+                    {
+                        "pid": parse_int(item.get("ProcessId")) or 0,
+                        "command": command,
+                        "cwd": "unavailable",
+                    }
+                )
+        return sorted(processes, key=lambda row: row["pid"])
+
+    result = safe_run(["ps", "-ax", "-o", "pid=,command="], timeout=6)
+    if result.returncode != 0:
+        return []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_raw, command = parts
+        if "ollama" not in command.lower():
+            continue
+        pid = parse_int(pid_raw)
+        if not pid:
+            continue
+        processes.append({"pid": pid, "command": command, "cwd": process_cwd(pid)})
+    return sorted(processes, key=lambda row: row["pid"])
+
+
+def print_processes(processes: List[dict]) -> None:
+    if not processes:
+        print("  none found")
+        return
+    for row in processes:
+        print(f"  PID {row['pid']:<6} cwd={row['cwd']} | {row['command']}")
+
+
+def start_private_server(ollama_bin: str, profile: MemoryProfile) -> Tuple[subprocess.Popen, Dict[str, str], str]:
+    ensure_artifact_dir()
+    host_port = pick_loopback_host()
+    env = build_scoped_env(os.environ, profile, host_port)
+    log_handle = SERVER_LOG_PATH.open("w", encoding="utf-8")
+    popen_kwargs = {
+        "args": [ollama_bin, "serve"],
+        "env": env,
+        "cwd": str(ARTIFACT_DIR),
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+    }
+    if platform.system() == "Windows":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(**popen_kwargs)
+    try:
+        wait_for_server(ollama_bin, env)
+    except Exception:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        log_handle.close()
+        raise
+    log_handle.close()
+    return process, env, host_port
+
+
+def stop_process(process: subprocess.Popen) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+        return True
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+
+def create_scoped_model(ollama_bin: str, env: Dict[str, str], alias: str, modelfile_path: Path) -> None:
+    command = [ollama_bin, "create", alias, "-f", str(modelfile_path)]
+    result = safe_run(command, env=env, timeout=1800)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise MlmMemoryError(f"Failed to create scoped alias '{alias}': {stderr}")
+
+
+def run_scoped_model(ollama_bin: str, env: Dict[str, str], alias: str, passthrough_args: Sequence[str]) -> int:
+    command = [ollama_bin, "run", alias, *passthrough_args]
+    if sys.stdin.isatty():
+        print_block("Scoped Run")
+        print(f"Scoped alias:      {alias}")
+        print(f"Private server:    {env['OLLAMA_HOST']}")
+        print(f"Run command:       {' '.join(shlex.quote(part) for part in command)}")
+        print()
+    process = subprocess.Popen(command, env=env)
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        try:
+            process.send_signal(signal.SIGINT)
+        except Exception:
+            pass
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return 130
+
+
+def print_shutdown_report(
+    *,
+    base_model: str,
+    alias: str,
+    private_host: str,
+    private_server_clean: bool,
+    scoped_ps_output: str,
+    scoped_ps_error: Optional[str],
+    exit_code: int,
+) -> None:
+    default_ollama = resolve_ollama_bin()
+    default_ps_output, default_ps_error = query_ollama_ps(default_ollama)
+    processes = collect_ollama_processes()
+
+    print()
+    print_block("Shutdown Report")
+    print(f"Exit code:         {exit_code}")
+    print(f"Base model:        {base_model}")
+    print(f"Scoped alias:      {alias}")
+    print(f"Private server:    {private_host}")
+    print(f"Server log:        {SERVER_LOG_PATH}")
+    print(f"Private shutdown:  {'clean' if private_server_clean else 'forced or incomplete'}")
+    print()
+    print("Scoped server models before shutdown:")
+    if scoped_ps_output:
+        for line in parse_ps_rows(scoped_ps_output):
+            print(f"  {line}")
+    else:
+        print(f"  {scoped_ps_error or 'none reported'}")
+    print()
+    print("Ollama processes after shutdown:")
+    print_processes(processes)
+    print()
+    print("Default-server models:")
+    if default_ps_output:
+        for line in parse_ps_rows(default_ps_output):
+            print(f"  {line}")
+    else:
+        print(f"  {default_ps_error or 'default server not reachable'}")
+    print()
+    if private_server_clean:
+        print("Scoped tuning remained isolated to the private launcher instance.")
+    else:
+        print("Scoped server did not exit cleanly; inspect the server log above.")
+
+
+def perform_analysis(write_report: bool = True) -> Tuple[HostInfo, MemoryProfile]:
+    host = collect_host_info()
+    profile = build_profile(host)
+    if write_report:
+        write_json(ANALYSIS_PATH, profile_to_json(host, profile))
+    return host, profile
+
+
+def cmd_analyze(_: argparse.Namespace) -> int:
+    host, profile = perform_analysis(write_report=True)
+    print_analysis(host, profile)
+    print()
+    print(f"Analysis JSON:     {ANALYSIS_PATH}")
     return 0
-  fi
 
-  if [[ -x /opt/homebrew/bin/ollama ]]; then
-    echo "/opt/homebrew/bin/ollama"
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    model = args.model or DEFAULT_MODEL
+    host, profile = perform_analysis(write_report=True)
+    modelfile_path, alias = write_modelfile(model, profile)
+    write_manifest(model, alias, modelfile_path, host, profile)
+    print_block("Setup Complete")
+    print(f"Artifact dir:      {ARTIFACT_DIR}")
+    print(f"Base model:        {model}")
+    print(f"Scoped alias:      {alias}")
+    print(f"Modelfile:         {modelfile_path}")
+    print(f"Analysis JSON:     {ANALYSIS_PATH}")
+    print(f"Manifest JSON:     {MANIFEST_PATH}")
+    print()
+    print("No global Ollama settings were changed.")
+    print("The scoped profile is only applied when you use 'mlm-memory run'.")
     return 0
-  fi
 
-  if [[ -x /usr/local/bin/ollama ]]; then
-    echo "/usr/local/bin/ollama"
+
+def cmd_status(_: argparse.Namespace) -> int:
+    ollama_bin = resolve_ollama_bin()
+    ps_output, ps_error = query_ollama_ps(ollama_bin)
+    processes = collect_ollama_processes()
+    manifest = load_json(MANIFEST_PATH) or {}
+
+    print_block("MLM Memory Status")
+    print(f"Artifact dir:      {ARTIFACT_DIR}")
+    print(f"Ollama binary:     {ollama_bin or 'not found'}")
+    if manifest:
+        print(f"Last base model:   {manifest.get('model', 'unknown')}")
+        print(f"Last scoped alias: {manifest.get('scoped_alias', 'unknown')}")
+    else:
+        print("Last scoped alias: none recorded")
+    print()
+    print("Default-server models:")
+    if ps_output:
+        for line in parse_ps_rows(ps_output):
+            print(f"  {line}")
+    else:
+        print(f"  {ps_error or 'default server not reachable'}")
+    print()
+    print("Ollama processes:")
+    print_processes(processes)
     return 0
-  fi
 
-  return 1
-}
 
-write_env_block() {
-  local rcfile=$1
-  [[ -f "$rcfile" ]] || return 0
+def cmd_run(args: argparse.Namespace) -> int:
+    model = args.model or args.positional_model or DEFAULT_MODEL
+    passthrough_args = list(args.passthrough or [])
+    if passthrough_args and passthrough_args[0] == "--":
+        passthrough_args = passthrough_args[1:]
 
-  awk '
-    /#MLM/ { next }
-    /OLLAMA_FLASH_ATTENTION/ { next }
-    /OLLAMA_KV_CACHE_TYPE/ { next }
-    /OLLAMA_MAX_LOADED_MODELS/ { next }
-    /OLLAMA_KEEP_ALIVE/ { next }
-    /OLLAMA_NUM_PARALLEL/ { next }
-    { print }
-  ' "$rcfile" > /tmp/_mlm_memory_rcfile_tmp
+    ollama_bin = resolve_ollama_bin()
+    if not ollama_bin:
+        raise MlmMemoryError("Ollama binary not found. Install Ollama or set OLLAMA_BIN before running 'mlm-memory run'.")
 
-  cat >> /tmp/_mlm_memory_rcfile_tmp <<'ENVBLOCK'
+    host, profile = perform_analysis(write_report=True)
+    modelfile_path, alias = write_modelfile(model, profile)
+    write_manifest(model, alias, modelfile_path, host, profile)
 
-# -- MLM-MEMORY -- OMEGA = 10.8x #MLM
-export OLLAMA_FLASH_ATTENTION=1        # FlashAttention: O(n) mem #MLM
-export OLLAMA_KV_CACHE_TYPE=q4_0       # 4-bit KV cache #MLM
-export OLLAMA_MAX_LOADED_MODELS=1      # one model loaded #MLM
-export OLLAMA_KEEP_ALIVE=0             # unload on idle #MLM
-export OLLAMA_NUM_PARALLEL=1           # single parallel run #MLM
-ENVBLOCK
+    print_block("Scoped Launch Plan")
+    print(f"Base model:        {model}")
+    print(f"Scoped alias:      {alias}")
+    print(f"Modelfile:         {modelfile_path}")
+    print(f"Headroom target:   {profile.headroom_target}")
+    print(f"Fit guidance:      {profile.fit_guidance}")
+    print()
+    print("This run will start a private Ollama server on loopback with scoped tuning only.")
 
-  mv /tmp/_mlm_memory_rcfile_tmp "$rcfile"
-  echo "  [OK] Env vars written to $rcfile"
-}
+    server_process = None
+    scoped_env: Optional[Dict[str, str]] = None
+    private_host = "unstarted"
+    exit_code = 1
+    scoped_ps_output = ""
+    scoped_ps_error = "server was not started"
+    private_server_clean = False
 
-print_phase "PHASE I -- Euler Identity: Setting Waste -> Zero"
-echo "  e^(i*pi) + 1 = 0  ->  KEEP_ALIVE + LOADED_MODELS -> 0"
+    try:
+        server_process, scoped_env, private_host = start_private_server(ollama_bin, profile)
+        create_scoped_model(ollama_bin, scoped_env, alias, modelfile_path)
+        exit_code = run_scoped_model(ollama_bin, scoped_env, alias, passthrough_args)
+        time.sleep(1.0)
+        scoped_ps_output, scoped_ps_error = query_ollama_ps(ollama_bin, scoped_env)
+        private_server_clean = stop_process(server_process)
+        return exit_code
+    finally:
+        if server_process is not None and server_process.poll() is None:
+            private_server_clean = stop_process(server_process)
+        print_shutdown_report(
+            base_model=model,
+            alias=alias,
+            private_host=private_host,
+            private_server_clean=private_server_clean,
+            scoped_ps_output=scoped_ps_output,
+            scoped_ps_error=scoped_ps_error,
+            exit_code=exit_code,
+        )
 
-require_cmd launchctl
-require_cmd sysctl
 
-OLLAMA_PATH=$(ollama_bin || true)
-if [[ -z "${OLLAMA_PATH}" ]]; then
-  echo "[ERROR] Ollama binary not found. Install first: brew install ollama" >&2
-  exit 1
-fi
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mlm-memory",
+        description="Cross-platform scoped Ollama memory launcher.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command")
 
-ARCH_NAME=$(uname -m)
-CHIP_NAME=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
-[[ -z "$CHIP_NAME" ]] && CHIP_NAME="Apple Silicon"
-LOGICAL_CPUS=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 8)
-NUM_THREADS=$(( LOGICAL_CPUS - 2 ))
-if (( NUM_THREADS < 1 )); then
-  NUM_THREADS=1
-fi
+    analyze = subparsers.add_parser("analyze", help="Inspect the host and print the derived memory profile.")
+    analyze.set_defaults(func=cmd_analyze)
 
-if [[ "$ARCH_NAME" != "arm64" ]]; then
-  echo "  [WARN] Detected $ARCH_NAME. This tuning is optimized for Apple Silicon."
-fi
+    setup = subparsers.add_parser("setup", help="Generate scoped artifacts without changing global Ollama behavior.")
+    setup.add_argument("--model", help=f"Base model/tag to prepare. Defaults to {DEFAULT_MODEL}.")
+    setup.set_defaults(func=cmd_setup)
 
-echo "  Using Ollama binary: $OLLAMA_PATH"
-echo "  Detected chip: $CHIP_NAME"
-echo "  Logical CPUs: $LOGICAL_CPUS (num_thread=$NUM_THREADS)"
+    run = subparsers.add_parser(
+        "run",
+        help="Launch a model through a private tuned Ollama server.",
+        description=(
+            "Launch a model through a private tuned Ollama server.\n"
+            "Pass extra arguments after the model name or after '--'; they are forwarded to 'ollama run'."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    run.add_argument("positional_model", nargs="?", help=f"Base model/tag to run. Defaults to {DEFAULT_MODEL}.")
+    run.add_argument("passthrough", nargs=argparse.REMAINDER, help="Arguments passed through to 'ollama run'.")
+    run.add_argument("--model", dest="model", help="Explicit base model/tag.")
+    run.set_defaults(func=cmd_run)
 
-echo "  Stopping Ollama to apply memory manifold..."
-pkill -f ollama 2>/dev/null || true
-sleep 1
+    status = subparsers.add_parser("status", help="Report active Ollama models and local processes.")
+    status.set_defaults(func=cmd_status)
 
-print_phase "PHASE II -- Fractal KV-Cache Quantization (4.0x factor)"
+    help_parser = subparsers.add_parser("help", help="Show this help output.")
+    help_parser.set_defaults(func=lambda _: parser.print_help() or 0)
 
-launchctl setenv OLLAMA_FLASH_ATTENTION 1
-launchctl setenv OLLAMA_KV_CACHE_TYPE q4_0
-launchctl setenv OLLAMA_MAX_LOADED_MODELS 1
-launchctl setenv OLLAMA_KEEP_ALIVE 0
-launchctl setenv OLLAMA_NUM_PARALLEL 1
+    return parser
 
-mandelbrot_iterate "KV_CACHE_TYPE=q4_0 -> |z_1| = 0.25"
-mandelbrot_iterate "FLASH_ATTENTION=1  -> |z_2| = 0.14"
 
-write_env_block "$HOME/.zshrc"
-write_env_block "$HOME/.bash_profile"
+def main(argv: Sequence[str]) -> int:
+    parser = build_parser()
+    if len(argv) == 0:
+        parser.print_help()
+        return 0
 
-print_phase "PHASE III -- Imaginary Axis Expansion (VM Compression, 1.5x factor)"
+    if argv[0] == "run":
+        run_parser = build_parser()
+        args, unknown = run_parser.parse_known_args(argv)
+        if getattr(args, "command", None) != "run":
+            args = parser.parse_args(argv)
+            return args.func(args)
+        args.passthrough = list(getattr(args, "passthrough", []) or []) + unknown
+    else:
+        args = parser.parse_args(argv)
 
-echo "  Tuning macOS kernel memory compressor..."
-if sudo sysctl -w vm.compressor_mode=4 >/dev/null 2>&1; then
-  mandelbrot_iterate "vm.compressor_mode=4 -> Im(z) compressed"
-else
-  echo "  [WARN] sysctl tuning skipped (sudo may be needed)"
-fi
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 1
 
-sudo sysctl -w kern.memorystatus_vm_pressure_sends_note=1 >/dev/null 2>&1 || true
+    try:
+        result = args.func(args)
+        return int(result or 0)
+    except MlmMemoryError as exc:
+        eprint(f"[ERROR] {exc}")
+        return 1
+    except KeyboardInterrupt:
+        eprint("[ERROR] Interrupted.")
+        return 130
 
-if command -v pmset >/dev/null 2>&1; then
-  sudo pmset -a sleep 0 >/dev/null 2>&1 && \
-    echo "  [OK] System sleep disabled (keeps memory state hot)" || true
-fi
 
-print_phase "PHASE IV -- Wavefunction Collapse via Optimized Modelfile"
-
-MODELFILE_DIR="$HOME/.ollama/mlm-memory_modelfiles"
-BASE_MODEL="richardyoung/qwen3-14b-abliterated:latest"
-MLM_MODEL="richardyoung/qwen3-14b-abliterated-mlm:latest"
-
-mkdir -p "$MODELFILE_DIR"
-
-cat > "$MODELFILE_DIR/optimized.Modelfile" <<MODELFILE
-# -- MLM-MEMORY -- Optimized Modelfile
-# Default base model for MLM workflow; change if needed
-FROM $BASE_MODEL
-
-# Context window: main lever for KV memory
-PARAMETER num_ctx 2048
-
-# Prompt processing peak memory
-PARAMETER num_batch 256
-
-# Unified memory on Apple Silicon: keep layers on GPU
-PARAMETER num_gpu 99
-
-# Thread count is chip-dependent across Apple Silicon; reserve 2 for macOS.
-PARAMETER num_thread $NUM_THREADS
-MODELFILE
-
-echo "  [OK] Optimized Modelfile written to: $MODELFILE_DIR/optimized.Modelfile"
-mandelbrot_iterate "Modelfile: |z_3| -> 0.067"
-
-print_phase "PHASE V -- Non-Persistent Runtime (Autostart Disabled)"
-
-PLIST_PATH="$HOME/Library/LaunchAgents/com.ollama.mlm-memory.plist"
-AGENT_LABEL="gui/$(id -u)/com.ollama.mlm-memory"
-
-launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
-launchctl disable "$AGENT_LABEL" >/dev/null 2>&1 || true
-rm -f "$PLIST_PATH"
-
-echo "  [OK] LaunchAgent disabled and removed (manual startup only)"
-mandelbrot_iterate "LaunchAgent: disabled -> no auto relaunch"
-
-print_phase "PHASE VI -- Final OMEGA Calculation"
-
-RAM_BYTES=$(sysctl -n hw.memsize)
-RAM_GB=$(( RAM_BYTES / 1024 / 1024 / 1024 ))
-EFFECTIVE_GB=$(( RAM_GB * 10 ))
-
-echo
-echo "  +-------------------------------------------------+"
-echo "  |  MLM-MEMORY - PROOF COMPLETE                   |"
-echo "  +-------------------------------------------------+"
-printf "  |  Physical RAM:          %3d GB                  |\n" "$RAM_GB"
-echo "  |                                                 |"
-echo "  |  Factor I   - KV Q4_0:   x 4.0                 |"
-echo "  |  Factor II  - FlashAttn: x 1.8                 |"
-echo "  |  Factor III - VM Comp:   x 1.5                 |"
-echo "  |                         ------                  |"
-echo "  |  OMEGA = 4.0 x 1.8 x 1.5 = 10.8x               |"
-echo "  |                                                 |"
-printf "  |  Effective Memory:     ~%3d GB                  |\n" "$EFFECTIVE_GB"
-echo "  +-------------------------------------------------+"
-
-echo
-echo "  NEXT STEP:"
-echo "  1) Edit: $MODELFILE_DIR/optimized.Modelfile (optional)"
-echo "  2) Default base: $BASE_MODEL"
-echo "  3) Build: ollama create $MLM_MODEL -f ~/.ollama/mlm-memory_modelfiles/optimized.Modelfile"
-echo "  4) Run:   ollama run $MLM_MODEL"
-echo
-echo "  Proof complete. OMEGA ~= 10.8x"
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

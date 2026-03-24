@@ -22,6 +22,13 @@ ANALYSIS_PATH = ARTIFACT_DIR / "analysis.json"
 MANIFEST_PATH = ARTIFACT_DIR / "manifest.json"
 SERVER_LOG_PATH = ARTIFACT_DIR / "last-run-server.log"
 REPORT_HEADER = "=" * 72
+# GiB threshold below which a unified-memory host is considered "small"
+# (e.g. standard 16 GiB M2 MacBook Air).  Used for profile selection and
+# budget estimation throughout this file.
+_SMALL_UNIFIED_GIB = 20
+# Extended model-load timeout inserted into the scoped environment so that
+# large quantized models do not time out on loaded machines.
+_LOAD_TIMEOUT = "600s"
 
 
 @dataclass
@@ -478,9 +485,18 @@ def estimate_budget_bytes(host: HostInfo) -> Optional[int]:
         return None
     gpu_total = sum(gpu.memory_bytes or 0 for gpu in host.gpus)
     if host.unified_memory:
-        budget = int(total * 0.58)
+        total_gib = total / (1024 ** 3)
+        # For ≤_SMALL_UNIFIED_GIB machines (e.g. M2 16 GB) apply a tighter
+        # static ratio (0.52 vs 0.58) and a more conservative cap on the
+        # available-RAM figure (0.88 vs 0.92).  The extra headroom (~10-15 %)
+        # absorbs the OS, browser, and background-sync processes that share
+        # the unified memory pool under a heavy workflow.
+        small = total_gib < _SMALL_UNIFIED_GIB
+        ratio = 0.52 if small else 0.58
+        available_cap = 0.88 if small else 0.92
+        budget = int(total * ratio)
         if host.available_ram_bytes:
-            budget = min(budget, int(host.available_ram_bytes * 0.92))
+            budget = min(budget, int(host.available_ram_bytes * available_cap))
     elif gpu_total:
         budget = int(total * 0.35 + gpu_total * 0.92)
         if host.available_ram_bytes:
@@ -498,8 +514,16 @@ def choose_fit_guidance(budget_bytes: Optional[int], host: HostInfo) -> str:
         return "Unknown budget; start with quantized 7B-14B class models and validate manually."
     budget_gib = budget_bytes / (1024 ** 3)
     if host.unified_memory:
+        if budget_gib < 8:
+            return "Best fit: 3B-7B quantized only; 14B class models will not fit at this budget."
         if budget_gib < 12:
             return "Best fit: 3B-7B quantized, or 8B with very short context."
+        if budget_gib < 20:
+            return (
+                "Best fit: 7B-14B quantized with aggressive context limits. "
+                "On 16 GiB unified-memory machines running heavy workflows, "
+                "prefer 7B q4_0 or 14B q4_0 with num_ctx ≤1280."
+            )
         if budget_gib < 24:
             return "Best fit: 7B-14B quantized with aggressive context limits."
         if budget_gib < 48:
@@ -522,7 +546,15 @@ def choose_fit_guidance(budget_bytes: Optional[int], host: HostInfo) -> str:
 
 def build_profile(host: HostInfo) -> MemoryProfile:
     logical = max(1, host.logical_cpus)
-    reserve = 2 if logical >= 4 else 1
+    # On unified-memory Apple Silicon (e.g. M2), leave an extra OS thread so
+    # background processes (Spotlight, iCloud, browser tabs) do not starve
+    # the inference threads and cause memory-pressure spikes.
+    if host.unified_memory and logical >= 6:
+        reserve = 3
+    elif logical >= 4:
+        reserve = 2
+    else:
+        reserve = 1
     threads = max(1, logical - reserve)
     total_gib = (host.total_ram_bytes or 0) / (1024 ** 3)
     has_gpu = bool(host.gpus)
@@ -550,6 +582,16 @@ def build_profile(host: HostInfo) -> MemoryProfile:
         num_batch = min(num_batch, 24)
         headroom = "up to 3x effective headroom on CPU-only hosts"
 
+    # 12–_SMALL_UNIFIED_GIB GiB unified-memory machines (standard M2/M3 MacBook Air 16 GB).
+    # Under a heavy workflow the OS, browser, and other apps consume 6–10 GB
+    # of the shared pool, so we need tighter context and batch limits than the
+    # generic "aggressive" band to avoid OOM mid-generation.
+    if host.unified_memory and total_gib and 12 <= total_gib < _SMALL_UNIFIED_GIB:
+        name = "unified-tight"
+        num_ctx = 1280
+        num_batch = 48
+        headroom = "about 2.5x effective headroom on 16 GiB unified-memory host"
+
     if host.unified_memory and total_gib and total_gib >= 64:
         name = "unified-large"
         num_ctx = 3072
@@ -564,6 +606,13 @@ def build_profile(host: HostInfo) -> MemoryProfile:
         "The 2-3x headroom target is heuristic only; model quantization, adapter layers, and prompt length still dominate memory use.",
         "If a model still fails to load, move to a smaller quantization or a smaller base model rather than raising context first.",
     ]
+    if name == "unified-tight":
+        caveats.append(
+            "16 GiB unified-memory hosts share RAM between CPU and GPU. "
+            "Under a heavy workflow (browser, IDE, background sync) the effective "
+            "model budget can drop to 6-8 GiB; prefer q4_0 or q4_K_M quantization "
+            "and keep num_ctx at or below 1280."
+        )
     if platform.system() == "Windows":
         caveats.append("Windows process cwd reporting is best-effort; shutdown reports may show cwd as unavailable.")
     if not has_gpu:
@@ -640,6 +689,7 @@ def print_analysis(host: HostInfo, profile: MemoryProfile) -> None:
     print(f"  - OLLAMA_KEEP_ALIVE={profile.keep_alive}")
     print(f"  - OLLAMA_NUM_PARALLEL={profile.num_parallel}")
     print(f"  - OLLAMA_MAX_QUEUE={profile.max_queue}")
+    print(f"  - OLLAMA_LOAD_TIMEOUT={_LOAD_TIMEOUT}")
     print()
     print("Caveats:")
     for item in profile.caveats:
@@ -689,6 +739,8 @@ def build_scoped_env(base_env: Optional[Dict[str, str]], profile: MemoryProfile,
     env["OLLAMA_MAX_QUEUE"] = str(profile.max_queue)
     env["OLLAMA_CONTEXT_LENGTH"] = str(profile.num_ctx)
     env.setdefault("OLLAMA_NO_CLOUD", "1")
+    # Allow up to 10 minutes for initial model load on loaded/slow systems.
+    env.setdefault("OLLAMA_LOAD_TIMEOUT", _LOAD_TIMEOUT)
     return env
 
 
@@ -699,7 +751,10 @@ def pick_loopback_host() -> str:
     return f"127.0.0.1:{port}"
 
 
-def wait_for_server(ollama_bin: str, env: Dict[str, str], timeout_s: float = 20.0) -> None:
+def wait_for_server(ollama_bin: str, env: Dict[str, str], timeout_s: float = 45.0) -> None:
+    # 45 s gives a loaded M2 MacBook Air (competing processes, slow SSD swap)
+    # roughly double the margin of the original 20 s default without making
+    # the error feedback unacceptably slow for fast machines.
     start = time.time()
     last_error = "server did not answer"
     while time.time() - start < timeout_s:
@@ -944,6 +999,31 @@ def perform_analysis(write_report: bool = True) -> Tuple[HostInfo, MemoryProfile
     return host, profile
 
 
+def check_macos_memory_pressure() -> Optional[str]:
+    """Return a warning string if macOS memory pressure is elevated, else None."""
+    if platform.system() != "Darwin" or not command_exists("memory_pressure"):
+        return None
+    # 6 s is generous for a local syscall-backed utility; avoids hanging the
+    # launch path on a heavily swapping machine while still allowing a retry.
+    result = safe_run(["memory_pressure"], timeout=6)
+    if result.returncode != 0:
+        return None
+    output = (result.stdout or "").lower()
+    if "critical" in output:
+        return (
+            "WARNING: macOS memory pressure is CRITICAL. "
+            "Model loading will likely fail or be extremely slow. "
+            "Close other applications before running a model."
+        )
+    if "warn" in output:
+        return (
+            "WARNING: macOS memory pressure is elevated (warn level). "
+            "Model loading may be slow or unstable. "
+            "Consider closing unused applications to free memory."
+        )
+    return None
+
+
 def cmd_analyze(_: argparse.Namespace) -> int:
     host, profile = perform_analysis(write_report=True)
     print_analysis(host, profile)
@@ -1018,6 +1098,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"Headroom target:   {profile.headroom_target}")
     print(f"Fit guidance:      {profile.fit_guidance}")
     print()
+    pressure_warning = check_macos_memory_pressure()
+    if pressure_warning:
+        eprint(pressure_warning)
     print("This run will start a private Ollama server on loopback with scoped tuning only.")
 
     server_process = None

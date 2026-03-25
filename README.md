@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/mlm-memory-banner.png" alt="MLM Memory Engine Preview">
+  <img src="./assets/alsdjlfkweoincoweubhowvubaelr.png" alt="MLM Memory Engine Banner">
 </p>
 
 <p align="center">
@@ -8,91 +8,82 @@
   <img alt="Headroom" src="https://img.shields.io/badge/TARGET-2x%E2%80%933x_HEADROOM-00ff9f?style=for-the-badge&labelColor=0a0a0f">
 </p>
 
-# ∞ MLM-MEMORY ∞
-
-`ACID // PLASMA // VOID`
+# MLM Memory Engine
 
 Cross-platform scoped memory optimization for Ollama.
 
-`mlm-memory` analyzes your machine (CPU, RAM, GPU where available), derives an aggressive memory profile, and launches models through a private scoped Ollama runtime so other Ollama usage on the system stays unchanged.
+- `mlm-memory` handles private runtime orchestration (`analyze`, `setup`, `run`, `status`)
+- `mlm-memory-extended` handles planning/observability (`preflight`, `recommend`, `context-fit`, `monitor`)
 
-## WHAT CHANGED (2026-03-19)
+## Highlights
 
-- Replaced the old Bash workflow with a Python CLI (`analyze`, `setup`, `run`, `status`, `help`).
-- Added cross-platform support for Linux, macOS, and Windows 10+ (no Docker).
-- Switched from global/system-level tuning to scoped/private runtime tuning only.
-- `run` now starts a private loopback Ollama server for isolation and prints a shutdown report on exit.
-- Added hardware analysis and adaptive profile selection instead of fixed Apple-only assumptions.
-- Added generated artifacts: `analysis.json`, `manifest.json`, model-specific Modelfiles, and run logs.
+### 2026-03-19 (core rewrite)
 
-## MIGRATION NOTES (FROM OLDER MLM-MEMORY)
+- Replaced legacy Bash flow with Python CLI.
+- Added Linux, macOS, and Windows 10+ support.
+- Moved from global tuning to process-scoped private loopback runtime.
+- Added adaptive hardware profiling and artifact generation.
 
-- Old `*-mlm` tags and new `mlm-memory-*:scoped` tags can coexist.
-- `ollama list` may show similar sizes for related tags; this does not always mean duplicate blob storage.
-- If you want to clean old scoped aliases only:
+### 2026-03-25 (extension)
 
-```bash
-ollama list | awk 'NR>1 {print $1}' | rg '^mlm-memory-' | while read -r m; do ollama rm "$m"; done
-```
+- Added `mlm-memory-extended` with Layer 4–7 analysis commands.
+- Added architecture-aware model recommendation (MLA / MoE / Hybrid / Transformer).
+- Added context-fit optimizer and live memory pressure monitor.
 
-- If you want to remove legacy custom tags (optional):
-
-```bash
-ollama rm richardyoung/qwen3-14b-abliterated-mlm:latest
-```
-
-## TARGET
+## What This Project Optimizes
 
 ```text
-Goal: increase practical model fit headroom by ~2x to 3x
-Method: tighter context/batch/concurrency + KV cache quantization + scoped runtime isolation
+Goal: improve practical model fit headroom (~2x to 3x in many real workloads)
+Method: lower runtime pressure (ctx/batch/concurrency) + KV quantization + scoped execution
 ```
 
-Important: this is heuristic tuning, not a hard guarantee. Final fit still depends on model quantization, prompt length, adapters, and Ollama build behavior.
+This is heuristic tuning, not a hard guarantee. Final fit depends on quantization, prompt length, adapters, and host load.
 
-## WHAT IT DOES
-
-1. Host analysis (Linux, macOS, Windows 10+)
-2. Memory profile derivation from detected hardware
-3. Scoped Modelfile generation for your selected base model
-4. Private loopback `ollama serve` launch with scoped env only
-5. Scoped alias build + run
-6. Shutdown/status report with active models and Ollama processes
-
-## WHAT IT DOES NOT DO
-
-- No global `launchctl` edits
-- No shell profile edits (`.zshrc`, `.bashrc`, etc.)
-- No Docker
-- No universal override of all Ollama models
-
-## REQUIREMENTS
+## Requirements
 
 - Python 3.9+
-- Ollama installed and available as `ollama` (or set `OLLAMA_BIN`)
+- Ollama installed and resolvable as `ollama` (or set `OLLAMA_BIN`)
 
-## QUICK START
+## Quick Start
 
 ### macOS / Linux
 
 ```bash
 cd /path/to/mlm
-chmod +x ./mlm-memory
+chmod +x ./mlm-memory ./mlm-memory-extended
+
+# 1) Baseline host/profile artifacts
 ./mlm-memory analyze
-./mlm-memory setup
-./mlm-memory run
+
+# 2) Evaluate and validate model fit
+./mlm-memory-extended recommend
+./mlm-memory-extended preflight --model deepseek-r1:14b
+./mlm-memory-extended context-fit --model deepseek-r1:14b --target 0.85
+
+# 3) Create scoped alias and run
+./mlm-memory setup --model deepseek-r1:14b
+./mlm-memory run --model deepseek-r1:14b
+
+# 4) Optional live monitor in another terminal
+./mlm-memory-extended monitor
 ```
 
 ### Windows 10+
 
 ```powershell
 cd C:\path\to\mlm
+
 python .\mlm-memory analyze
-python .\mlm-memory setup
-python .\mlm-memory run
+python .\mlm-memory-extended recommend
+python .\mlm-memory-extended preflight --model deepseek-r1:14b
+python .\mlm-memory-extended context-fit --model deepseek-r1:14b --target 0.85
+python .\mlm-memory setup --model deepseek-r1:14b
+python .\mlm-memory run --model deepseek-r1:14b
 ```
 
-## COMMANDS
+## Commands
+
+### Base CLI (`mlm-memory`)
 
 ```text
 mlm-memory analyze
@@ -102,62 +93,123 @@ mlm-memory status
 mlm-memory help
 ```
 
-Examples:
+### Extension CLI (`mlm-memory-extended`)
 
-```bash
-./mlm-memory setup --model qwen2.5:14b
-./mlm-memory run --model qwen2.5:14b
-./mlm-memory run llama3.1:8b -- --verbose
-./mlm-memory status
+```text
+mlm-memory-extended preflight --model MODEL [--params-b FLOAT] [--quant QUANT]
+mlm-memory-extended recommend
+mlm-memory-extended context-fit --model MODEL [--params-b FLOAT] [--quant QUANT] [--target FLOAT]
+mlm-memory-extended monitor [--interval FLOAT]
 ```
 
-## SCOPED TUNING USED
+## Adaptive Profile Logic (`mlm-memory`)
 
-The run path applies process-local Ollama settings such as:
+| Profile | Condition | num_ctx | num_batch |
+|---|---|---:|---:|
+| survival | total RAM < 16 GiB | 1024 | 32 |
+| aggressive | 16 GiB <= total RAM < 32 GiB | 1536 | 64 |
+| balanced-aggressive | total RAM >= 32 GiB | 2048 | 128 |
+| cpu-tight | no GPU and total RAM < 24 GiB (override) | capped at 1024 | capped at 24 |
+| unified-large | unified memory and total RAM >= 64 GiB (override) | 3072 | 192 |
 
+Notes:
+- `num_thread` is derived from logical CPU count.
+- `num_gpu=999` is used on unified-memory hosts.
+
+## Scoped Runtime Tuning (`mlm-memory run`)
+
+Applied only to the private server process:
+
+- `OLLAMA_HOST=<random 127.0.0.1:port>`
 - `OLLAMA_KV_CACHE_TYPE=q4_0`
 - `OLLAMA_FLASH_ATTENTION=1`
 - `OLLAMA_MAX_LOADED_MODELS=1`
 - `OLLAMA_KEEP_ALIVE=0`
 - `OLLAMA_NUM_PARALLEL=1`
 - `OLLAMA_MAX_QUEUE=1`
+- `OLLAMA_CONTEXT_LENGTH=<derived num_ctx>`
+- `OLLAMA_NO_CLOUD=1` (if unset)
 
-And per-model Modelfile parameters such as:
+Generated Modelfile params include `num_ctx`, `num_batch`, `num_thread`, and `num_gpu` (when applicable).
 
-- `num_ctx` (reduced)
-- `num_batch` (reduced)
-- `num_thread` (auto-sized)
-- `num_gpu` (set when appropriate, e.g. unified-memory Apple Silicon)
+## Extension Behavior (`mlm-memory-extended`)
 
-## ARTIFACTS
+### `preflight`
 
-Created under `~/.ollama/mlm-memory_modelfiles`:
+- Computes projected weights + KV memory.
+- Finds an optimal context via binary search (internal fill target `0.88`).
+- Verdict bands: `<75%` comfortable, `75%–92%` tight, `>=92%` critical.
+
+### `recommend`
+
+- Ranks built-in catalog by budget fit.
+- Tier thresholds: fit `<=80%`, tight `<=105%`, otherwise too large.
+
+### `context-fit`
+
+- Prints context-vs-memory table.
+- Recommends `PARAMETER num_ctx` for your target fill (`--target`, default `0.85`).
+- MLA entries include conservative-estimate note and adjusted context hint.
+
+### `monitor`
+
+- macOS uses `vm_stat`; Linux uses `/proc/meminfo`.
+- Poll interval default is `1.0s`.
+- Pressure bands: normal `<65%`, elevated `65%–82%`, high `82%–92%`, critical `>92%`.
+
+## Artifacts
+
+Stored in `~/.ollama/mlm-memory_modelfiles`:
 
 - `analysis.json`
 - `manifest.json`
 - `<model-hash>.Modelfile`
 - `last-run-server.log`
 
-## SHUTDOWN CONFIRMATION
-
-After `run` exits (including Ctrl+C), the tool reports:
-
-- private scoped server shutdown status
-- scoped server model state before shutdown
-- currently running Ollama processes with PID and cwd when available
-- default server model state if reachable
-
-## VALIDATION
+## Validation
 
 ```bash
 python3 -m py_compile mlm-memory
+python3 -m py_compile mlm-memory-extended
 ./mlm-memory --help
+./mlm-memory-extended --help
 ./mlm-memory analyze
 ./mlm-memory status
 ```
 
-## ROLLBACK
+## Docs Sync (HTML)
+
+`mlm-memory.html` is generated from `README.md` + `mlm-memory`:
+
+```bash
+./sync-docs
+```
+
+## Migration Notes
+
+- Old `*-mlm` tags and new `mlm-memory-*:scoped` tags can coexist.
+- Similar sizes in `ollama list` do not always imply duplicate blob storage.
+
+Clean scoped aliases only:
+
+```bash
+ollama list | awk 'NR>1 {print $1}' | rg '^mlm-memory-' | while read -r m; do ollama rm "$m"; done
+```
+
+Optional legacy cleanup:
+
+```bash
+ollama rm richardyoung/qwen3-14b-abliterated-mlm:latest
+```
+
+## Rollback
 
 ```bash
 rm -rf ~/.ollama/mlm-memory_modelfiles
 ```
+
+## Known Limits
+
+- Layer 4 in extension is estimator/recommendation logic, not runtime KV eviction.
+- True paged attention requires runtime support outside this project.
+- MLA fit outputs are intentionally conservative.

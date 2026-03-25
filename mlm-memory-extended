@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""
+mlm-memory-extended — Layer 4–7 extension for gs-ai/mlm-memory
+================================================================
+Adds to the existing mlm-memory CLI:
+  • preflight   — validate model fit BEFORE loading (saves OOM crashes)
+  • recommend   — hardware-aware model recommender with MLA/SSM awareness
+  • monitor     — real-time memory pressure display during a run
+  • context-fit — dynamic Layer 4 context window optimizer
+
+Drop this file next to the existing `mlm-memory` script and run:
+  ./mlm-memory-extended preflight --model qwen2.5:14b
+  ./mlm-memory-extended recommend
+  ./mlm-memory-extended monitor
+  ./mlm-memory-extended context-fit --model deepseek-r1:14b --target 0.85
+
+Requirements: Python 3.9+  |  No extra dependencies beyond stdlib
+Compatible with: mlm-memory repo as of 2026-03-19
+"""
+
+import argparse
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ── Shared constants mirrored from mlm-memory ────────────────────────────────
+ARTIFACT_DIR   = Path.home() / ".ollama" / "mlm-memory_modelfiles"
+ANALYSIS_PATH  = ARTIFACT_DIR / "analysis.json"
+MANIFEST_PATH  = ARTIFACT_DIR / "manifest.json"
+LINE           = "─" * 72
+BLOCK          = "═" * 72
+
+# ── GGUF quantization size-per-billion-params table (bytes) ──────────────────
+# Derived from llama.cpp empirical measurements across 7B–70B models.
+QUANT_BPP: Dict[str, float] = {
+    "f32":     4.000,
+    "f16":     2.000,
+    "bf16":    2.000,
+    "q8_0":    1.031,
+    "q6_k":    0.828,
+    "q5_k_m":  0.703,
+    "q5_k_s":  0.680,
+    "q5_0":    0.650,
+    "q4_k_m":  0.567,
+    "q4_k_s":  0.540,
+    "q4_0":    0.508,
+    "q3_k_m":  0.438,
+    "q3_k_s":  0.414,
+    "q2_k":    0.313,
+    # MLA-architecture models carry a smaller KV footprint per layer
+    # so effective BPP is lower; tag them with the mla_ prefix for
+    # the recommender to surface them preferentially on tight hardware.
+    "mla_q4_k_m": 0.390,  # DeepSeek V2/V3/R1 effective
+    "mla_q4_0":   0.340,
+}
+
+# ── MLA-aware model catalogue ─────────────────────────────────────────────────
+# Each entry: (ollama_tag, params_B, arch, quant, vram_gib_approx, notes)
+@dataclass
+class ModelEntry:
+    tag:          str
+    params_b:     float
+    arch:         str          # "transformer" | "mla" | "moe" | "ssm" | "hybrid"
+    quant:        str
+    vram_gib:     float
+    notes:        str = ""
+
+MODEL_CATALOGUE: List[ModelEntry] = [
+    # ── SSM / Hybrid (Layer 7) ────────────────────────────────────────────
+    ModelEntry("jamba",               52.0, "hybrid",     "q4_k_m", 26.0, "O(1) state — no KV cache growth; best long-context on tight RAM"),
+    # ── MLA-architecture (Layer 6) ────────────────────────────────────────
+    ModelEntry("deepseek-r1:1.5b",    1.5,  "mla",        "q4_k_m",  1.1, "MLA — 93% KV reduction; thinking model; runs on any M-chip"),
+    ModelEntry("deepseek-r1:7b",      7.0,  "mla",        "q4_k_m",  4.4, "MLA — reasoning; 8 GB comfortable"),
+    ModelEntry("deepseek-r1:8b",      8.0,  "mla",        "q4_k_m",  5.0, "MLA — reasoning; 8 GB comfortable"),
+    ModelEntry("deepseek-r1:14b",    14.0,  "mla",        "q4_k_m",  8.9, "MLA — best open reasoning model under 16 GB"),
+    ModelEntry("deepseek-r1:32b",    32.0,  "mla",        "q4_k_m", 19.9, "MLA — GPT-4-class reasoning; needs 24 GB+"),
+    ModelEntry("deepseek-r1:70b",    70.0,  "mla",        "q4_k_m", 42.5, "MLA — flagship; needs 48 GB+"),
+    # ── Standard transformers ─────────────────────────────────────────────
+    ModelEntry("phi4:14b",           14.0,  "transformer", "q4_k_m",  8.8, "Microsoft Phi-4; punches above weight on reasoning"),
+    ModelEntry("qwen2.5:7b",          7.0,  "transformer", "q4_k_m",  4.4, "Alibaba; excellent code + math"),
+    ModelEntry("qwen2.5:14b",        14.0,  "transformer", "q4_k_m",  8.9, "Best quality/size ratio under 16 GB"),
+    ModelEntry("qwen2.5:32b",        32.0,  "transformer", "q4_k_m", 19.9, "Alibaba 32B; rivals Llama 70B on benchmarks"),
+    ModelEntry("qwen2.5:72b",        72.0,  "transformer", "q4_k_m", 43.0, "Alibaba flagship; heretic pick for 48 GB+"),
+    ModelEntry("mistral:7b",          7.0,  "transformer", "q4_k_m",  4.4, "Classic workhorse"),
+    ModelEntry("gemma2:9b",           9.0,  "transformer", "q4_k_m",  5.6, "Google; very clean outputs"),
+    ModelEntry("gemma2:27b",         27.0,  "transformer", "q4_k_m", 16.5, "Google 27B; polished"),
+    ModelEntry("llama3.1:8b",         8.0,  "transformer", "q4_k_m",  5.0, "Meta Llama 3.1 8B"),
+    ModelEntry("llama3.1:70b",       70.0,  "transformer", "q4_k_m", 42.5, "Meta flagship; benchmark baseline"),
+    ModelEntry("hermes3:8b",          8.0,  "transformer", "q4_k_m",  5.0, "NousResearch fine-tune; agentic tasks"),
+    ModelEntry("dolphin3:8b",         8.0,  "transformer", "q4_k_m",  5.0, "Uncensored fine-tune; no guardrails"),
+    ModelEntry("solar:10.7b",        10.7,  "transformer", "q4_k_m",  6.6, "Upstage; 10.7B that performs like 13B"),
+    # ── MoE (sparse activation — only active params hit memory) ──────────
+    ModelEntry("mixtral:8x7b",       46.7,  "moe",         "q4_k_m", 26.9, "MoE — 13B active per token; needs 28 GB+"),
+    ModelEntry("mixtral:8x22b",     141.0,  "moe",         "q4_k_m", 80.0, "MoE — 39B active; needs 80 GB+"),
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def gib(b: float) -> str:
+    return f"{b / (1024**3):.1f} GiB"
+
+def load_analysis() -> Optional[dict]:
+    if not ANALYSIS_PATH.exists():
+        return None
+    try:
+        return json.loads(ANALYSIS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+def safe_run(cmd: List[str], timeout: float = 6) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="")
+
+def resolve_ollama() -> Optional[str]:
+    env_bin = os.environ.get("OLLAMA_BIN")
+    if env_bin and Path(env_bin).exists():
+        return env_bin
+    return shutil.which("ollama")
+
+def total_ram_bytes() -> Optional[int]:
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        r = safe_run(["sysctl", "-n", "hw.memsize"])
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            pass
+    if sys_name == "Linux":
+        mi = Path("/proc/meminfo")
+        if mi.exists():
+            for line in mi.read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    digits = re.findall(r"\d+", line)
+                    if digits:
+                        return int(digits[0]) * 1024
+    return None
+
+def available_ram_bytes() -> Optional[int]:
+    sys_name = platform.system()
+    if sys_name == "Linux":
+        mi = Path("/proc/meminfo")
+        if mi.exists():
+            for line in mi.read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    digits = re.findall(r"\d+", line)
+                    if digits:
+                        return int(digits[0]) * 1024
+    if sys_name == "Darwin":
+        r = safe_run(["vm_stat"])
+        if r.returncode == 0:
+            page_size = 4096
+            pm = re.search(r"page size of (\d+)", r.stdout)
+            if pm:
+                page_size = int(pm.group(1))
+            totals = 0
+            for label in ["Pages free", "Pages speculative", "Pages inactive", "Pages purgeable"]:
+                m = re.search(rf"{label}:\s+(\d+)", r.stdout)
+                if m:
+                    totals += int(m.group(1))
+            return totals * page_size
+    return None
+
+def is_unified_memory() -> bool:
+    analysis = load_analysis()
+    if analysis:
+        return analysis.get("host", {}).get("unified_memory", False)
+    return platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+
+def budget_bytes() -> Optional[int]:
+    analysis = load_analysis()
+    if analysis:
+        pb = analysis.get("profile", {}).get("estimated_budget_bytes")
+        if pb:
+            return int(pb)
+    total = total_ram_bytes()
+    if not total:
+        return None
+    ratio = 0.52 if is_unified_memory() else 0.42
+    avail = available_ram_bytes()
+    budget = int(total * ratio)
+    if avail:
+        budget = min(budget, int(avail * 0.88))
+    return budget
+
+def print_header(title: str) -> None:
+    print()
+    print(BLOCK)
+    print(f"  {title}")
+    print(BLOCK)
+
+def print_section(title: str) -> None:
+    print()
+    print(LINE)
+    print(f"  {title}")
+    print(LINE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 4 IMPLEMENTATION: Dynamic Context Window Optimizer
+# Based on the StreamingLLM / H2O principle:
+#   keep attention sinks (first N tokens) + recent window,
+#   map this to a concrete num_ctx ceiling per model.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def kv_cache_bytes(num_ctx: int, params_b: float, quant: str = "q4_0") -> int:
+    """
+    Estimate KV cache memory for a given context length.
+
+    Formula derived from transformer KV cache structure:
+      KV_bytes = 2 × num_layers × num_ctx × d_head × dtype_bytes
+               ≈ num_ctx × params_B × kv_ratio × dtype_bytes
+
+    We approximate num_layers and d_head from params_B using
+    empirical scaling laws (Chinchilla-adjacent):
+      num_layers ≈ 4.0 × params_B^0.31
+      d_head     ≈ 128  (stable across 7B–70B)
+      num_heads  ≈ 32   (stable at these scales)
+    """
+    num_layers = max(8, int(4.0 * (params_b ** 0.31) * 4))
+    d_kv       = 128
+    num_heads  = 32
+    dtype_bytes = 0.5 if "q4" in quant else (1.0 if "q8" in quant else 2.0)
+    # MLA compresses KV to a latent of dimension d_kv/8
+    mla_factor = 0.07 if quant.startswith("mla_") else 1.0
+    kv = 2 * num_layers * num_heads * d_kv * num_ctx * dtype_bytes * mla_factor
+    return int(kv)
+
+def model_weight_bytes(params_b: float, quant: str) -> int:
+    bpp = QUANT_BPP.get(quant.lower(), QUANT_BPP["q4_k_m"])
+    return int(params_b * 1e9 * bpp)
+
+def optimal_context(params_b: float, quant: str, budget_b: int,
+                    target_fill: float = 0.85,
+                    min_ctx: int = 512, max_ctx: int = 131072) -> Tuple[int, float]:
+    """
+    Layer 4: Binary-search the largest context window that keeps
+    total memory (weights + KV cache) under budget × target_fill.
+
+    Returns (optimal_num_ctx, fill_ratio).
+    """
+    weight_b   = model_weight_bytes(params_b, quant)
+    headroom_b = int(budget_b * target_fill) - weight_b
+
+    if headroom_b <= 0:
+        return min_ctx, weight_b / budget_b
+
+    # Binary search over context lengths
+    lo, hi = min_ctx, max_ctx
+    best = min_ctx
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        kv  = kv_cache_bytes(mid, params_b, quant)
+        if kv <= headroom_b:
+            best = mid
+            lo   = mid + 1
+        else:
+            hi   = mid - 1
+
+    total_used = weight_b + kv_cache_bytes(best, params_b, quant)
+    fill       = total_used / budget_b
+    return best, fill
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMAND: preflight
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    model   = args.model
+    quant   = args.quant.lower()
+    bgt     = budget_bytes()
+    total   = total_ram_bytes()
+    unified = is_unified_memory()
+
+    print_header(f"PRE-FLIGHT VALIDATOR · {model}")
+
+    if bgt is None or total is None:
+        print("  [!] Cannot determine system memory. Run `mlm-memory analyze` first.")
+        return 1
+
+    print(f"  Total RAM       : {gib(total)}")
+    print(f"  Effective budget: {gib(bgt)}  (unified={unified})")
+    print(f"  Model           : {model}")
+    print(f"  Quant assumed   : {quant}")
+
+    # Try to find the model in the catalogue
+    entry = next((m for m in MODEL_CATALOGUE if m.tag == model), None)
+    params_b = entry.params_b if entry else args.params_b
+    arch     = entry.arch     if entry else "transformer"
+
+    if params_b is None:
+        print("\n  [!] --params-b required when model is not in the built-in catalogue.")
+        return 1
+
+    print(f"  Architecture    : {arch}")
+    print(f"  Parameters      : {params_b}B")
+
+    weight_b = model_weight_bytes(params_b, quant)
+    print_section("Weight Memory")
+    print(f"  Model weights   : {gib(weight_b)}")
+    print(f"  Budget remaining: {gib(max(0, bgt - weight_b))}")
+
+    if weight_b > bgt:
+        shortfall = weight_b - bgt
+        print(f"\n  ✗  WILL NOT FIT — {gib(shortfall)} over budget")
+        print(f"     Suggestion: switch to a lower quantization or smaller model.")
+        _suggest_alternatives(params_b, bgt, quant)
+        return 2
+
+    # Find optimal context
+    opt_ctx, fill = optimal_context(params_b, quant, bgt, target_fill=0.88)
+    kv_b = kv_cache_bytes(opt_ctx, params_b, quant)
+
+    print_section("KV Cache & Context Window (Layer 4 Analysis)")
+    print(f"  Optimal num_ctx : {opt_ctx:,} tokens")
+    print(f"  KV cache at ctx : {gib(kv_b)}")
+    print(f"  Total projected : {gib(weight_b + kv_b)}")
+    print(f"  Budget fill     : {fill:.1%}")
+
+    # Pressure verdict
+    print_section("Verdict")
+    if fill < 0.75:
+        verdict = "✓  COMFORTABLE — model fits with headroom"
+        code = 0
+    elif fill < 0.92:
+        verdict = "⚠  TIGHT — will load but watch memory pressure"
+        code = 0
+    else:
+        verdict = "✗  CRITICAL — likely OOM during generation at full context"
+        code = 2
+
+    print(f"  {verdict}")
+
+    if arch == "mla":
+        print(f"\n  ★  MLA ARCHITECTURE BONUS (Layer 6)")
+        print(f"     DeepSeek MLA compresses KV to ~7% of standard size.")
+        print(f"     Effective fit is significantly better than these estimates.")
+
+    if arch in ("ssm", "hybrid"):
+        print(f"\n  ★  STATE SPACE MODEL (Layer 7)")
+        print(f"     No KV cache at all. Context length has O(1) memory cost.")
+        print(f"     This model can run at any context length within weight budget.")
+
+    print_section("Recommended Modelfile Parameters")
+    print(f"  PARAMETER num_ctx   {opt_ctx}")
+    kv_quant = "q4_0" if arch != "mla" else "f16"  # MLA is already compressed
+    print(f"  OLLAMA_KV_CACHE_TYPE={kv_quant}")
+    print(f"  OLLAMA_FLASH_ATTENTION=1")
+    recommended_batch = min(512, max(32, opt_ctx // 16))
+    print(f"  PARAMETER num_batch {recommended_batch}")
+
+    return code
+
+
+def _suggest_alternatives(params_b: float, budget_b: int, current_quant: str) -> None:
+    print("\n  Alternative quantizations that may fit:")
+    quant_order = ["q4_k_m", "q4_0", "q3_k_m", "q3_k_s", "q2_k"]
+    found = False
+    for q in quant_order:
+        w = model_weight_bytes(params_b, q)
+        if w < budget_b:
+            ctx, _ = optimal_context(params_b, q, budget_b)
+            print(f"    {q:<12} → weights={gib(w)}, max_ctx={ctx:,}")
+            found = True
+    if not found:
+        smaller = [m for m in MODEL_CATALOGUE if m.vram_gib * 1.074e9 < budget_b]
+        if smaller:
+            smaller.sort(key=lambda m: m.vram_gib, reverse=True)
+            print(f"\n  Largest model that fits: {smaller[0].tag}  ({smaller[0].vram_gib:.1f} GiB)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMAND: recommend
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_recommend(args: argparse.Namespace) -> int:
+    bgt     = budget_bytes()
+    total   = total_ram_bytes()
+    unified = is_unified_memory()
+
+    print_header("HARDWARE-AWARE MODEL RECOMMENDER")
+
+    if bgt is None:
+        print("  [!] Cannot determine budget. Run `mlm-memory analyze` first.")
+        return 1
+
+    print(f"  Effective budget: {gib(bgt)}")
+    print(f"  Unified memory  : {unified}")
+
+    # Tiers
+    tier_fit     : List[ModelEntry] = []
+    tier_tight   : List[ModelEntry] = []
+    tier_too_big : List[ModelEntry] = []
+
+    for m in MODEL_CATALOGUE:
+        vram_b = m.vram_gib * (1024**3)
+        if vram_b <= bgt * 0.80:
+            tier_fit.append(m)
+        elif vram_b <= bgt * 1.05:
+            tier_tight.append(m)
+        else:
+            tier_too_big.append(m)
+
+    tier_fit.sort(key=lambda m: (m.vram_gib, m.arch != "mla"), reverse=True)
+
+    arch_icon = {"mla": "★MLA", "ssm": "∞SSM", "hybrid": "⊕HYB",
+                 "moe": "⊗MoE", "transformer": "    "}
+
+    print_section("✓  Fits Comfortably")
+    if not tier_fit:
+        print("  None at this budget.")
+    for m in tier_fit[:12]:
+        icon = arch_icon.get(m.arch, "    ")
+        opt_ctx, _ = optimal_context(m.params_b, m.quant, bgt)
+        print(f"  {icon}  {m.tag:<35} {m.vram_gib:5.1f} GiB  ctx≤{opt_ctx:,}  {m.notes}")
+
+    print_section("⚠  Tight Fit (may work with MMM tuning)")
+    if not tier_tight:
+        print("  None.")
+    for m in tier_tight:
+        icon = arch_icon.get(m.arch, "    ")
+        print(f"  {icon}  {m.tag:<35} {m.vram_gib:5.1f} GiB  {m.notes}")
+
+    print_section("Architecture Legend")
+    print("  ★MLA = Multi-head Latent Attention (DeepSeek) — 93% KV reduction [Layer 6]")
+    print("  ∞SSM = State Space Model — O(1) memory, no KV cache [Layer 7]")
+    print("  ⊕HYB = Hybrid SSM+Attention (Jamba) — partial KV cache [Layer 7]")
+    print("  ⊗MoE = Mixture of Experts — sparse activation, only ~25% params active")
+    print("       = Standard transformer")
+
+    print_section("Pull Commands")
+    for m in tier_fit[:5]:
+        print(f"  ollama pull {m.tag}")
+
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMAND: context-fit
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_context_fit(args: argparse.Namespace) -> int:
+    model   = args.model
+    target  = args.target
+    bgt     = budget_bytes()
+
+    print_header(f"CONTEXT WINDOW OPTIMIZER · {model}")
+
+    if bgt is None:
+        print("  [!] No budget data. Run `mlm-memory analyze` first.")
+        return 1
+
+    entry    = next((m for m in MODEL_CATALOGUE if m.tag == model), None)
+    params_b = entry.params_b if entry else args.params_b
+    quant    = (entry.quant if entry else args.quant).lower()
+    arch     = entry.arch if entry else "transformer"
+
+    if params_b is None:
+        print("  [!] --params-b required for models not in catalogue.")
+        return 1
+
+    print(f"  Budget          : {gib(bgt)}")
+    print(f"  Model           : {model}  ({params_b}B, {arch}, {quant})")
+    print(f"  Target fill     : {target:.0%}")
+
+    print_section("Context Window vs Memory Trade-off")
+    print(f"  {'num_ctx':>10}  {'KV cache':>10}  {'Total':>10}  {'Fill':>6}  Status")
+    print(f"  {'':-<10}  {'':-<10}  {'':-<10}  {'':-<6}  ------")
+
+    weight_b = model_weight_bytes(params_b, quant)
+    for ctx in [512, 1024, 1280, 1536, 2048, 3072, 4096, 8192, 16384, 32768, 65536]:
+        kv   = kv_cache_bytes(ctx, params_b, quant)
+        total = weight_b + kv
+        fill  = total / bgt
+        if fill > 1.20:
+            break
+        status = "✓ OK" if fill <= target else ("⚠ TIGHT" if fill <= 1.0 else "✗ OOM")
+        marker = " ◄" if abs(fill - target) < 0.05 else ""
+        print(f"  {ctx:>10,}  {gib(kv):>10}  {gib(total):>10}  {fill:>5.1%}  {status}{marker}")
+
+    opt_ctx, opt_fill = optimal_context(params_b, quant, bgt, target)
+    print_section("Recommendation")
+    print(f"  PARAMETER num_ctx {opt_ctx}   ← optimal for {target:.0%} budget target")
+    print(f"  Fill ratio        {opt_fill:.1%}")
+    print(f"  KV cache size     {gib(kv_cache_bytes(opt_ctx, params_b, quant))}")
+
+    if arch == "mla":
+        print(f"\n  ★  MLA model: KV estimates are conservative.")
+        print(f"     Actual KV will be ~7% of these values. You can run ctx x14 larger.")
+        mla_ctx = min(131072, opt_ctx * 14)
+        print(f"     Effective MLA-adjusted context: {mla_ctx:,}")
+
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMAND: monitor
+# Real-time memory pressure display — polls every N seconds
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mem_pressure_darwin() -> Tuple[float, float, str]:
+    """Returns (used_gib, total_gib, pressure_label)"""
+    r = safe_run(["vm_stat"])
+    total_b = total_ram_bytes() or 0
+    if r.returncode != 0 or not total_b:
+        return 0.0, 0.0, "unknown"
+
+    page_size = 4096
+    pm = re.search(r"page size of (\d+)", r.stdout)
+    if pm:
+        page_size = int(pm.group(1))
+
+    def pages(label: str) -> int:
+        m = re.search(rf"{label}:\s+(\d+)", r.stdout)
+        return int(m.group(1)) if m else 0
+
+    wired        = pages("Pages wired down")
+    active       = pages("Pages active")
+    compressed   = pages("Pages occupied by compressor")
+    speculative  = pages("Pages speculative")
+
+    used_b  = (wired + active + compressed) * page_size
+    total_g = total_b / (1024**3)
+    used_g  = used_b  / (1024**3)
+    pct     = used_g / total_g
+
+    if pct < 0.65:   label = "NORMAL"
+    elif pct < 0.82: label = "ELEVATED"
+    elif pct < 0.92: label = "HIGH"
+    else:            label = "CRITICAL"
+
+    return used_g, total_g, label
+
+
+def _mem_pressure_linux() -> Tuple[float, float, str]:
+    mi = Path("/proc/meminfo")
+    if not mi.exists():
+        return 0.0, 0.0, "unknown"
+    vals: Dict[str, int] = {}
+    for line in mi.read_text().splitlines():
+        parts = line.split(":", 1)
+        if len(parts) != 2:
+            continue
+        digits = re.findall(r"\d+", parts[1])
+        if digits:
+            vals[parts[0].strip()] = int(digits[0]) * 1024
+    total_b = vals.get("MemTotal", 0)
+    avail_b = vals.get("MemAvailable", vals.get("MemFree", 0))
+    used_b  = total_b - avail_b
+    if not total_b:
+        return 0.0, 0.0, "unknown"
+    total_g = total_b / (1024**3)
+    used_g  = used_b  / (1024**3)
+    pct     = used_g / total_g
+    if pct < 0.65:   label = "NORMAL"
+    elif pct < 0.82: label = "ELEVATED"
+    elif pct < 0.92: label = "HIGH"
+    else:            label = "CRITICAL"
+    return used_g, total_g, label
+
+
+def _bar(pct: float, width: int = 40) -> str:
+    filled = int(pct * width)
+    empty  = width - filled
+    bar    = "█" * filled + "░" * empty
+    if pct > 0.92:   return f"\033[91m{bar}\033[0m"   # red
+    elif pct > 0.82: return f"\033[93m{bar}\033[0m"   # yellow
+    elif pct > 0.65: return f"\033[96m{bar}\033[0m"   # cyan
+    else:            return f"\033[92m{bar}\033[0m"   # green
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    interval = args.interval
+    sys_name = platform.system()
+
+    print_header("REAL-TIME MEMORY PRESSURE MONITOR")
+    print(f"  Polling every {interval}s. Press Ctrl+C to stop.\n")
+
+    ollama_bin = resolve_ollama()
+    bgt        = budget_bytes()
+
+    try:
+        while True:
+            if sys_name == "Darwin":
+                used, total, label = _mem_pressure_darwin()
+            else:
+                used, total, label = _mem_pressure_linux()
+
+            pct = used / total if total else 0
+            bar = _bar(pct)
+
+            ts = time.strftime("%H:%M:%S")
+
+            # Ollama processes
+            ollama_procs = 0
+            if ollama_bin:
+                r = safe_run(["pgrep", "-c", "ollama"], timeout=2)
+                try:
+                    ollama_procs = int(r.stdout.strip())
+                except ValueError:
+                    pass
+
+            budget_warn = ""
+            if bgt and used * (1024**3) > bgt * 0.95:
+                budget_warn = "  ⚠  OVER MLM BUDGET"
+
+            sys.stdout.write(
+                f"\r  [{ts}]  {bar}  {used:.1f}/{total:.1f} GiB  "
+                f"{pct:.1%}  [{label}]  ollama_procs={ollama_procs}{budget_warn}    "
+            )
+            sys.stdout.flush()
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print("\n\n  Monitor stopped.")
+
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mlm-memory-extended",
+        description="Layer 4–7 extension for gs-ai/mlm-memory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  preflight     Validate model fit BEFORE loading (prevents OOM crashes)
+  recommend     Hardware-aware model list with MLA/SSM architecture tags
+  context-fit   Dynamic optimal context window calculator (Layer 4)
+  monitor       Real-time memory pressure display
+
+Examples:
+  ./mlm-memory-extended preflight --model deepseek-r1:14b
+  ./mlm-memory-extended preflight --model my-custom:7b --params-b 7 --quant q4_k_m
+  ./mlm-memory-extended recommend
+  ./mlm-memory-extended context-fit --model qwen2.5:14b --target 0.85
+  ./mlm-memory-extended monitor --interval 2
+        """,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # preflight
+    pf = sub.add_parser("preflight", help="Pre-flight model fit validator")
+    pf.add_argument("--model",    required=True, help="Model tag (e.g. deepseek-r1:14b)")
+    pf.add_argument("--params-b", type=float, default=None,
+                    dest="params_b", help="Parameter count in billions (auto if in catalogue)")
+    pf.add_argument("--quant",    default="q4_k_m",
+                    help="Quantization level (default: q4_k_m)")
+
+    # recommend
+    sub.add_parser("recommend", help="Hardware-aware model recommender")
+
+    # context-fit
+    cf = sub.add_parser("context-fit", help="Optimal context window calculator")
+    cf.add_argument("--model",    required=True, help="Model tag")
+    cf.add_argument("--params-b", type=float, default=None, dest="params_b")
+    cf.add_argument("--quant",    default="q4_k_m")
+    cf.add_argument("--target",   type=float, default=0.85,
+                    help="Budget fill target 0.0–1.0 (default: 0.85)")
+
+    # monitor
+    mon = sub.add_parser("monitor", help="Real-time memory pressure monitor")
+    mon.add_argument("--interval", type=float, default=1.0,
+                     help="Poll interval in seconds (default: 1.0)")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    dispatch = {
+        "preflight":   cmd_preflight,
+        "recommend":   cmd_recommend,
+        "context-fit": cmd_context_fit,
+        "monitor":     cmd_monitor,
+    }
+
+    fn = dispatch.get(args.command)
+    if fn is None:
+        parser.print_help()
+        return 1
+
+    return fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

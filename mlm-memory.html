@@ -22,7 +22,7 @@
   body {
     background:
       linear-gradient(rgba(10,10,15,0.84), rgba(10,10,15,0.90)),
-      url("./assets/mlm-memory-banner.png") center top / cover no-repeat fixed;
+      url("./assets/alsdjlfkweoincoweubhowvubaelr.png") center top / cover no-repeat fixed;
     color: var(--acid);
     font-family: 'Share Tech Mono', monospace;
     min-height: 100vh;
@@ -245,14 +245,14 @@
 
 <div class="container">
   <div class="hero">
-    <div class="title-label">⚡ APPLE SILICON · OLLAMA · MEMORY AMPLIFICATION PROTOCOL ⚡</div>
+    <div class="title-label">⚡ CROSS-PLATFORM · OLLAMA · SCOPED MEMORY OPTIMIZATION ⚡</div>
     <h1 class="title">MLM<br><span>MEMORY</span><br>ENGINE</h1>
     <p class="subtitle">The html view is generated from README.md and mlm-memory. Edit those two files, then run <code class="inline">./sync-docs</code>.</p>
     <div>
-      <span class="math-eq">Ω = 4.0 × 1.8 × 1.5</span>
-      <span class="math-eq">Ω ≈ 10.8×</span>
+      <span class="math-eq">Profiles: Adaptive</span>
+      <span class="math-eq">Target: 2x-3x Headroom</span>
       <span class="math-eq">KV: q4_0</span>
-      <span class="math-eq">BASE: qwen3-14b</span>
+      <span class="math-eq">Runtime: Private Loopback</span>
     </div>
   </div>
 
@@ -262,118 +262,162 @@
     <div class="markdown-docs" id="readme-docs">
 <!-- README_INJECT_START -->
 <p align="center">
-  <img src="./assets/mlm-memory-banner.png" alt="MLM Memory Engine Preview">
+  <img src="./assets/alsdjlfkweoincoweubhowvubaelr.png" alt="MLM Memory Engine Banner">
 </p>
 <p align="center">
   <img alt="Cross Platform" src="https://img.shields.io/badge/CROSS_PLATFORM-Linux%20%7C%20macOS%20%7C%20Windows-00ff9f?style=for-the-badge&labelColor=0a0a0f">
   <img alt="Ollama" src="https://img.shields.io/badge/OLLAMA-SCOPED_RUNTIME-ff006e?style=for-the-badge&logo=ollama&logoColor=ffffff&labelColor=0a0a0f">
   <img alt="Headroom" src="https://img.shields.io/badge/TARGET-2x%E2%80%933x_HEADROOM-00ff9f?style=for-the-badge&labelColor=0a0a0f">
 </p>
-<h1>∞ MLM-MEMORY ∞</h1>
-<p><code class="inline">ACID // PLASMA // VOID</code></p>
+<h1>MLM Memory Engine</h1>
 <p>Cross-platform scoped memory optimization for Ollama.</p>
-<p><code class="inline">mlm-memory</code> analyzes your machine (CPU, RAM, GPU where available), derives an aggressive memory profile, and launches models through a private scoped Ollama runtime so other Ollama usage on the system stays unchanged.</p>
-<h2>WHAT CHANGED (2026-03-19)</h2>
 <ul>
-<li>Replaced the old Bash workflow with a Python CLI (<code class="inline">analyze</code>, <code class="inline">setup</code>, <code class="inline">run</code>, <code class="inline">status</code>, <code class="inline">help</code>).</li>
-<li>Added cross-platform support for Linux, macOS, and Windows 10+ (no Docker).</li>
-<li>Switched from global/system-level tuning to scoped/private runtime tuning only.</li>
-<li><code class="inline">run</code> now starts a private loopback Ollama server for isolation and prints a shutdown report on exit.</li>
-<li>Added hardware analysis and adaptive profile selection instead of fixed Apple-only assumptions.</li>
-<li>Added generated artifacts: <code class="inline">analysis.json</code>, <code class="inline">manifest.json</code>, model-specific Modelfiles, and run logs.</li>
+<li><code class="inline">mlm-memory</code> handles private runtime orchestration (<code class="inline">analyze</code>, <code class="inline">setup</code>, <code class="inline">run</code>, <code class="inline">status</code>)</li>
+<li><code class="inline">mlm-memory-extended</code> handles planning/observability (<code class="inline">preflight</code>, <code class="inline">recommend</code>, <code class="inline">context-fit</code>, <code class="inline">monitor</code>)</li>
 </ul>
-<h2>MIGRATION NOTES (FROM OLDER MLM-MEMORY)</h2>
+<h2>Highlights</h2>
+<h3>2026-03-19 (core rewrite)</h3>
 <ul>
-<li>Old <code class="inline">*-mlm</code> tags and new <code class="inline">mlm-memory-*:scoped</code> tags can coexist.</li>
-<li><code class="inline">ollama list</code> may show similar sizes for related tags; this does not always mean duplicate blob storage.</li>
-<li>If you want to clean old scoped aliases only:</li>
+<li>Replaced legacy Bash flow with Python CLI.</li>
+<li>Added Linux, macOS, and Windows 10+ support.</li>
+<li>Moved from global tuning to process-scoped private loopback runtime.</li>
+<li>Added adaptive hardware profiling and artifact generation.</li>
 </ul>
-<pre><code>ollama list | awk 'NR&gt;1 {print $1}' | rg '^mlm-memory-' | while read -r m; do ollama rm "$m"; done</code></pre>
+<h3>2026-03-25 (extension)</h3>
 <ul>
-<li>If you want to remove legacy custom tags (optional):</li>
+<li>Added <code class="inline">mlm-memory-extended</code> with Layer 4–7 analysis commands.</li>
+<li>Added architecture-aware model recommendation (MLA / MoE / Hybrid / Transformer).</li>
+<li>Added context-fit optimizer and live memory pressure monitor.</li>
 </ul>
-<pre><code>ollama rm richardyoung/qwen3-14b-abliterated-mlm:latest</code></pre>
-<h2>TARGET</h2>
-<pre><code>Goal: increase practical model fit headroom by ~2x to 3x
-Method: tighter context/batch/concurrency + KV cache quantization + scoped runtime isolation</code></pre>
-<p>Important: this is heuristic tuning, not a hard guarantee. Final fit still depends on model quantization, prompt length, adapters, and Ollama build behavior.</p>
-<h2>WHAT IT DOES</h2>
-<p>1. Host analysis (Linux, macOS, Windows 10+) 2. Memory profile derivation from detected hardware 3. Scoped Modelfile generation for your selected base model 4. Private loopback <code class="inline">ollama serve</code> launch with scoped env only 5. Scoped alias build + run 6. Shutdown/status report with active models and Ollama processes</p>
-<h2>WHAT IT DOES NOT DO</h2>
-<ul>
-<li>No global <code class="inline">launchctl</code> edits</li>
-<li>No shell profile edits (<code class="inline">.zshrc</code>, <code class="inline">.bashrc</code>, etc.)</li>
-<li>No Docker</li>
-<li>No universal override of all Ollama models</li>
-</ul>
-<h2>REQUIREMENTS</h2>
+<h2>What This Project Optimizes</h2>
+<pre><code>Goal: improve practical model fit headroom (~2x to 3x in many real workloads)
+Method: lower runtime pressure (ctx/batch/concurrency) + KV quantization + scoped execution</code></pre>
+<p>This is heuristic tuning, not a hard guarantee. Final fit depends on quantization, prompt length, adapters, and host load.</p>
+<h2>Requirements</h2>
 <ul>
 <li>Python 3.9+</li>
-<li>Ollama installed and available as <code class="inline">ollama</code> (or set <code class="inline">OLLAMA_BIN</code>)</li>
+<li>Ollama installed and resolvable as <code class="inline">ollama</code> (or set <code class="inline">OLLAMA_BIN</code>)</li>
 </ul>
-<h2>QUICK START</h2>
+<h2>Quick Start</h2>
 <h3>macOS / Linux</h3>
 <pre><code>cd /path/to/mlm
-chmod +x ./mlm-memory
+chmod +x ./mlm-memory ./mlm-memory-extended
+
+# 1) Baseline host/profile artifacts
 ./mlm-memory analyze
-./mlm-memory setup
-./mlm-memory run</code></pre>
+
+# 2) Evaluate and validate model fit
+./mlm-memory-extended recommend
+./mlm-memory-extended preflight --model deepseek-r1:14b
+./mlm-memory-extended context-fit --model deepseek-r1:14b --target 0.85
+
+# 3) Create scoped alias and run
+./mlm-memory setup --model deepseek-r1:14b
+./mlm-memory run --model deepseek-r1:14b
+
+# 4) Optional live monitor in another terminal
+./mlm-memory-extended monitor</code></pre>
 <h3>Windows 10+</h3>
 <pre><code>cd C:\path\to\mlm
+
 python .\mlm-memory analyze
-python .\mlm-memory setup
-python .\mlm-memory run</code></pre>
-<h2>COMMANDS</h2>
+python .\mlm-memory-extended recommend
+python .\mlm-memory-extended preflight --model deepseek-r1:14b
+python .\mlm-memory-extended context-fit --model deepseek-r1:14b --target 0.85
+python .\mlm-memory setup --model deepseek-r1:14b
+python .\mlm-memory run --model deepseek-r1:14b</code></pre>
+<h2>Commands</h2>
+<h3>Base CLI (<code class="inline">mlm-memory</code>)</h3>
 <pre><code>mlm-memory analyze
 mlm-memory setup [--model MODEL]
 mlm-memory run [--model MODEL] [MODEL] [-- &lt;ollama run args...&gt;]
 mlm-memory status
 mlm-memory help</code></pre>
-<p>Examples:</p>
-<pre><code>./mlm-memory setup --model qwen2.5:14b
-./mlm-memory run --model qwen2.5:14b
-./mlm-memory run llama3.1:8b -- --verbose
-./mlm-memory status</code></pre>
-<h2>SCOPED TUNING USED</h2>
-<p>The run path applies process-local Ollama settings such as:</p>
+<h3>Extension CLI (<code class="inline">mlm-memory-extended</code>)</h3>
+<pre><code>mlm-memory-extended preflight --model MODEL [--params-b FLOAT] [--quant QUANT]
+mlm-memory-extended recommend
+mlm-memory-extended context-fit --model MODEL [--params-b FLOAT] [--quant QUANT] [--target FLOAT]
+mlm-memory-extended monitor [--interval FLOAT]</code></pre>
+<h2>Adaptive Profile Logic (<code class="inline">mlm-memory</code>)</h2>
+<p>| Profile | Condition | num_ctx | num_batch | |---|---|---:|---:| | survival | total RAM &lt; 16 GiB | 1024 | 32 | | aggressive | 16 GiB &lt;= total RAM &lt; 32 GiB | 1536 | 64 | | balanced-aggressive | total RAM &gt;= 32 GiB | 2048 | 128 | | cpu-tight | no GPU and total RAM &lt; 24 GiB (override) | capped at 1024 | capped at 24 | | unified-large | unified memory and total RAM &gt;= 64 GiB (override) | 3072 | 192 |</p>
+<p>Notes:</p>
 <ul>
+<li><code class="inline">num_thread</code> is derived from logical CPU count.</li>
+<li><code class="inline">num_gpu=999</code> is used on unified-memory hosts.</li>
+</ul>
+<h2>Scoped Runtime Tuning (<code class="inline">mlm-memory run</code>)</h2>
+<p>Applied only to the private server process:</p>
+<ul>
+<li><code class="inline">OLLAMA_HOST=&lt;random 127.0.0.1:port&gt;</code></li>
 <li><code class="inline">OLLAMA_KV_CACHE_TYPE=q4_0</code></li>
 <li><code class="inline">OLLAMA_FLASH_ATTENTION=1</code></li>
 <li><code class="inline">OLLAMA_MAX_LOADED_MODELS=1</code></li>
 <li><code class="inline">OLLAMA_KEEP_ALIVE=0</code></li>
 <li><code class="inline">OLLAMA_NUM_PARALLEL=1</code></li>
 <li><code class="inline">OLLAMA_MAX_QUEUE=1</code></li>
+<li><code class="inline">OLLAMA_CONTEXT_LENGTH=&lt;derived num_ctx&gt;</code></li>
+<li><code class="inline">OLLAMA_NO_CLOUD=1</code> (if unset)</li>
 </ul>
-<p>And per-model Modelfile parameters such as:</p>
+<p>Generated Modelfile params include <code class="inline">num_ctx</code>, <code class="inline">num_batch</code>, <code class="inline">num_thread</code>, and <code class="inline">num_gpu</code> (when applicable).</p>
+<h2>Extension Behavior (<code class="inline">mlm-memory-extended</code>)</h2>
+<h3><code class="inline">preflight</code></h3>
 <ul>
-<li><code class="inline">num_ctx</code> (reduced)</li>
-<li><code class="inline">num_batch</code> (reduced)</li>
-<li><code class="inline">num_thread</code> (auto-sized)</li>
-<li><code class="inline">num_gpu</code> (set when appropriate, e.g. unified-memory Apple Silicon)</li>
+<li>Computes projected weights + KV memory.</li>
+<li>Finds an optimal context via binary search (internal fill target <code class="inline">0.88</code>).</li>
+<li>Verdict bands: <code class="inline">&lt;75%</code> comfortable, <code class="inline">75%–92%</code> tight, <code class="inline">&gt;=92%</code> critical.</li>
 </ul>
-<h2>ARTIFACTS</h2>
-<p>Created under <code class="inline">~/.ollama/mlm-memory_modelfiles</code>:</p>
+<h3><code class="inline">recommend</code></h3>
+<ul>
+<li>Ranks built-in catalog by budget fit.</li>
+<li>Tier thresholds: fit <code class="inline">&lt;=80%</code>, tight <code class="inline">&lt;=105%</code>, otherwise too large.</li>
+</ul>
+<h3><code class="inline">context-fit</code></h3>
+<ul>
+<li>Prints context-vs-memory table.</li>
+<li>Recommends <code class="inline">PARAMETER num_ctx</code> for your target fill (<code class="inline">--target</code>, default <code class="inline">0.85</code>).</li>
+<li>MLA entries include conservative-estimate note and adjusted context hint.</li>
+</ul>
+<h3><code class="inline">monitor</code></h3>
+<ul>
+<li>macOS uses <code class="inline">vm_stat</code>; Linux uses <code class="inline">/proc/meminfo</code>.</li>
+<li>Poll interval default is <code class="inline">1.0s</code>.</li>
+<li>Pressure bands: normal <code class="inline">&lt;65%</code>, elevated <code class="inline">65%–82%</code>, high <code class="inline">82%–92%</code>, critical <code class="inline">&gt;92%</code>.</li>
+</ul>
+<h2>Artifacts</h2>
+<p>Stored in <code class="inline">~/.ollama/mlm-memory_modelfiles</code>:</p>
 <ul>
 <li><code class="inline">analysis.json</code></li>
 <li><code class="inline">manifest.json</code></li>
 <li><code class="inline">&lt;model-hash&gt;.Modelfile</code></li>
 <li><code class="inline">last-run-server.log</code></li>
 </ul>
-<h2>SHUTDOWN CONFIRMATION</h2>
-<p>After <code class="inline">run</code> exits (including Ctrl+C), the tool reports:</p>
-<ul>
-<li>private scoped server shutdown status</li>
-<li>scoped server model state before shutdown</li>
-<li>currently running Ollama processes with PID and cwd when available</li>
-<li>default server model state if reachable</li>
-</ul>
-<h2>VALIDATION</h2>
+<h2>Validation</h2>
 <pre><code>python3 -m py_compile mlm-memory
+python3 -m py_compile mlm-memory-extended
 ./mlm-memory --help
+./mlm-memory-extended --help
 ./mlm-memory analyze
 ./mlm-memory status</code></pre>
-<h2>ROLLBACK</h2>
+<h2>Docs Sync (HTML)</h2>
+<p><code class="inline">mlm-memory.html</code> is generated from <code class="inline">README.md</code> + <code class="inline">mlm-memory</code>:</p>
+<pre><code>./sync-docs</code></pre>
+<h2>Migration Notes</h2>
+<ul>
+<li>Old <code class="inline">*-mlm</code> tags and new <code class="inline">mlm-memory-*:scoped</code> tags can coexist.</li>
+<li>Similar sizes in <code class="inline">ollama list</code> do not always imply duplicate blob storage.</li>
+</ul>
+<p>Clean scoped aliases only:</p>
+<pre><code>ollama list | awk 'NR&gt;1 {print $1}' | rg '^mlm-memory-' | while read -r m; do ollama rm "$m"; done</code></pre>
+<p>Optional legacy cleanup:</p>
+<pre><code>ollama rm richardyoung/qwen3-14b-abliterated-mlm:latest</code></pre>
+<h2>Rollback</h2>
 <pre><code>rm -rf ~/.ollama/mlm-memory_modelfiles</code></pre>
+<h2>Known Limits</h2>
+<ul>
+<li>Layer 4 in extension is estimator/recommendation logic, not runtime KV eviction.</li>
+<li>True paged attention requires runtime support outside this project.</li>
+<li>MLA fit outputs are intentionally conservative.</li>
+</ul>
 <!-- README_INJECT_END -->
     </div>
   </div>
@@ -1512,7 +1556,7 @@ if __name__ == "__main__":
   </div>
 
   <div class="footer">
-    Ω = 10.8× · Apple Silicon · MLM-MEMORY · README-INJECTED
+    Cross-Platform · Scoped Runtime · MLM-MEMORY · README-INJECTED
   </div>
 </div>
 
